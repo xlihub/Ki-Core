@@ -35,6 +35,8 @@ jobs:
   prepare-release:
     name: Prepare Release Metadata
     runs-on: ubuntu-latest
+    # Fork safety: release jobs remain disabled until the repository variable is enabled.
+    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true'
     outputs:
       version: ${{ steps.metadata.outputs.version }}
     steps:

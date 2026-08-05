@@ -50,19 +50,12 @@ PY
 
 IFS=$'\t' read -r upstream_repository upstream_tag upstream_commit <<< "$upstream_values"
 
-if ! resolved_commit="$(git rev-parse --verify "${upstream_tag}^{commit}" 2>/dev/null)"; then
-    echo "Mapped AionCore tag is not available locally: $upstream_tag" >&2
-    exit 1
-fi
-
-if [[ "$resolved_commit" != "$upstream_commit" ]]; then
-    echo "AionCore tag $upstream_tag resolves to $resolved_commit and does not match peeledCommit $upstream_commit" >&2
-    exit 1
-fi
-
 if [[ "${KI_CORE_VERIFY_REMOTE_TAG:-0}" == "1" ]]; then
-    remote_refs="$(git ls-remote --tags "https://github.com/${upstream_repository}.git" \
-        "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}")"
+    if ! remote_refs="$(git ls-remote --tags "https://github.com/${upstream_repository}.git" \
+        "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}")"; then
+        echo "Failed to query remote AionCore tag: $upstream_tag" >&2
+        exit 1
+    fi
     remote_commit="$(awk -v tag="$upstream_tag" '
         $2 == "refs/tags/" tag "^{}" { peeled = $1 }
         $2 == "refs/tags/" tag { direct = $1 }
@@ -72,6 +65,21 @@ if [[ "${KI_CORE_VERIFY_REMOTE_TAG:-0}" == "1" ]]; then
         echo "Remote AionCore tag $upstream_tag does not match peeledCommit $upstream_commit" >&2
         exit 1
     fi
+else
+    if ! resolved_commit="$(git rev-parse --verify "${upstream_tag}^{commit}" 2>/dev/null)"; then
+        echo "Mapped AionCore tag is not available locally: $upstream_tag" >&2
+        exit 1
+    fi
+
+    if [[ "$resolved_commit" != "$upstream_commit" ]]; then
+        echo "AionCore tag $upstream_tag resolves to $resolved_commit and does not match peeledCommit $upstream_commit" >&2
+        exit 1
+    fi
+fi
+
+if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
+    echo "Mapped AionCore peeled commit is not available in the checkout: $upstream_commit" >&2
+    exit 1
 fi
 
 history_ref="${KI_CORE_RELEASE_HISTORY_REF:-}"

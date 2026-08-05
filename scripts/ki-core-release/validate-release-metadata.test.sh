@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 validator="$script_dir/validate-release-metadata.sh"
 updater="$script_dir/update-release-map.sh"
+real_git="$(command -v git)"
 
 if [[ ! -x "$validator" || ! -x "$updater" ]]; then
     echo "Ki-Core release metadata scripts must exist and be executable" >&2
@@ -118,6 +119,37 @@ init_case_repo() {
 valid_repo="$(init_case_repo valid)"
 run_expect "$valid_repo" 0 "Ki-Core release metadata validation passed" \
     env KI_CORE_RELEASE_HISTORY_REF=mapping-base bash scripts/ki-core-release/validate-release-metadata.sh
+
+local_tag_missing_repo="$(init_case_repo local-tag-missing)"
+git -C "$local_tag_missing_repo" tag -d v0.1.58 v0.1.57 >/dev/null
+run_expect "$local_tag_missing_repo" 1 "Mapped AionCore tag is not available locally" \
+    env KI_CORE_RELEASE_HISTORY_REF=mapping-base bash scripts/ki-core-release/validate-release-metadata.sh
+
+remote_tag_repo="$(init_case_repo remote-tag)"
+remote_tag_commit="$(git -C "$remote_tag_repo" rev-parse 'v0.1.58^{commit}')"
+git -C "$remote_tag_repo" tag -d v0.1.58 v0.1.57 >/dev/null
+fake_git_dir="$tmpdir/fake-git"
+mkdir -p "$fake_git_dir"
+cat > "$fake_git_dir/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "ls-remote" ]]; then
+    printf '%s\trefs/tags/v0.1.58\n' "$KI_CORE_FAKE_REMOTE_COMMIT"
+    exit 0
+fi
+
+exec "$KI_CORE_REAL_GIT" "$@"
+EOF
+chmod +x "$fake_git_dir/git"
+run_expect "$remote_tag_repo" 0 "Ki-Core release metadata validation passed" \
+    env \
+    PATH="$fake_git_dir:$PATH" \
+    KI_CORE_REAL_GIT="$real_git" \
+    KI_CORE_FAKE_REMOTE_COMMIT="$remote_tag_commit" \
+    KI_CORE_VERIFY_REMOTE_TAG=1 \
+    KI_CORE_RELEASE_HISTORY_REF=mapping-base \
+    bash scripts/ki-core-release/validate-release-metadata.sh
 
 tag_mismatch_repo="$(init_case_repo tag-mismatch)"
 python3 - "$tag_mismatch_repo/ki-core-upstream.json" <<'PY'

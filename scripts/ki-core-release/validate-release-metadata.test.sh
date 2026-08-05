@@ -156,6 +156,15 @@ run_expect "$patch_repo" 0 "already matches the requested mapping" \
     env KI_CORE_RECORDED_AT=2026-08-06 bash scripts/ki-core-release/update-release-map.sh \
     0.1.1 v0.1.58 "$patch_upstream_commit"
 
+regression_repo="$(init_case_repo version-regression)"
+regression_upstream_commit="$(git -C "$regression_repo" rev-parse 'v0.1.58^{commit}')"
+printf '%s\n' '0.0.9' > "$regression_repo/ki-core-version.txt"
+run_expect "$regression_repo" 1 "strictly increasing SemVer order" \
+    env KI_CORE_RECORDED_AT=2026-08-06 bash scripts/ki-core-release/update-release-map.sh \
+    0.0.9 v0.1.58 "$regression_upstream_commit"
+run_expect "$regression_repo" 1 "Current Ki-Core version 0.0.9 is missing" \
+    bash scripts/ki-core-release/validate-release-metadata.sh
+
 conflict_repo="$(init_case_repo conflicting-version)"
 conflict_upstream_commit="$(git -C "$conflict_repo" rev-parse 'v0.1.58^{commit}')"
 run_expect "$conflict_repo" 1 "already exists with different provenance" \

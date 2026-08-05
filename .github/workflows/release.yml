@@ -90,8 +90,13 @@ jobs:
             echo "release_commit is not the current product/main head" >&2
             exit 1
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
-            echo "Release tag already exists: $RELEASE_TAG" >&2
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
+            $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+            $2 == "refs/tags/" tag { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }
+          ')"
+          if [[ -n "$remote_tag" && "$remote_tag" != "$RELEASE_COMMIT" ]]; then
+            echo "Existing release tag points to an unexpected commit" >&2
             exit 1
           fi
 
@@ -321,25 +326,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > draft-release.json 2>draft-error.txt; then
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
+          jq \
+            --arg tag "$RELEASE_TAG" \
+            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
+            release-pages.json > draft-matches.json
+          draft_count="$(jq 'length' draft-matches.json)"
+          if [[ "$draft_count" == "1" ]]; then
             jq -e \
               --arg tag "$RELEASE_TAG" \
               --arg commit "$RELEASE_COMMIT" \
-              '.draft == true and .tag_name == $tag and .target_commitish == $commit' \
-              draft-release.json > /dev/null
+              '.[0] | .draft == true and .tag_name == $tag and .target_commitish == $commit' \
+              draft-matches.json > /dev/null
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          elif grep -q "HTTP 404" draft-error.txt; then
+          elif [[ "$draft_count" == "0" ]]; then
             if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
               echo "Release tag already exists without a matching draft" >&2
               exit 1
             fi
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            cat draft-error.txt >&2
+            echo "Multiple draft releases use tag $RELEASE_TAG" >&2
             exit 1
           fi
 
-          rm -f draft-release.json draft-error.txt
+          rm -f release-pages.json draft-matches.json
 
       - name: Create draft with Release Please
         if: steps.draft.outputs.exists == 'false'
@@ -374,12 +385,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > draft-release.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
+          jq \
+            --arg tag "$RELEASE_TAG" \
+            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
+            release-pages.json > draft-matches.json
           jq -e \
             --arg tag "$RELEASE_TAG" \
             --arg commit "$RELEASE_COMMIT" \
-            '.draft == true and .tag_name == $tag and .target_commitish == $commit' \
-            draft-release.json > /dev/null
+            'length == 1 and .[0].draft == true and .[0].tag_name == $tag and .[0].target_commitish == $commit' \
+            draft-matches.json > /dev/null
+          jq '.[0]' draft-matches.json > draft-release.json
 
           mapfile -t expected_assets < <(find release-assets -maxdepth 1 -type f -print | sort)
           mapfile -t remote_assets < <(jq -r '.assets[].name' draft-release.json | sort)
@@ -403,7 +419,11 @@ jobs:
           for asset_path in "${expected_assets[@]}"; do
             asset_name="$(basename "$asset_path")"
             if printf '%s\n' "${remote_assets[@]}" | grep -Fxq "$asset_name"; then
-              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset_name" --dir existing-assets
+              asset_id="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .id' draft-release.json)"
+              gh api \
+                -H "Accept: application/octet-stream" \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                > "existing-assets/$asset_name"
               if [[ "$(sha256sum "$asset_path" | awk '{print $1}')" != "$(sha256sum "existing-assets/$asset_name" | awk '{print $1}')" ]]; then
                 echo "Existing draft asset hash does not match: $asset_name" >&2
                 exit 1
@@ -413,20 +433,114 @@ jobs:
             fi
           done
           if (( ${#upload_args[@]} > 0 )); then
-            gh release upload "$RELEASE_TAG" "${upload_args[@]}" --repo "$GITHUB_REPOSITORY"
+            upload_url="$(jq -r '.upload_url | split("{")[0]' draft-release.json)"
+            for asset_path in "${upload_args[@]}"; do
+              asset_name="$(basename "$asset_path")"
+              curl --fail-with-body --location --request POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary "@$asset_path" \
+                --output /dev/null \
+                "${upload_url}?name=${asset_name}"
+            done
           fi
 
+          rm -f release-pages.json draft-matches.json draft-release.json
+
       - name: Download and verify the populated draft
+        id: verified_draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
+          set -euo pipefail
+
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
+          jq \
+            --arg tag "$RELEASE_TAG" \
+            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
+            release-pages.json > draft-matches.json
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$RELEASE_COMMIT" \
+            'length == 1 and .[0].draft == true and .[0].tag_name == $tag and .[0].target_commitish == $commit' \
+            draft-matches.json > /dev/null
+          jq '.[0]' draft-matches.json > draft-release.json
+
           mkdir verified-draft
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir verified-draft
+          while IFS=$'\t' read -r asset_id asset_name; do
+            if [[ ! "$asset_name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Draft contains an unsafe asset name: $asset_name" >&2
+              exit 1
+            fi
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "verified-draft/$asset_name"
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' draft-release.json)
           scripts/ki-core-release/verify-release-assets.sh stable verified-draft
+
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
+            $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+            $2 == "refs/tags/" tag { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }
+          ')"
+          if [[ -n "$remote_tag" && "$remote_tag" != "$RELEASE_COMMIT" ]]; then
+            echo "Existing release tag points to an unexpected commit" >&2
+            exit 1
+          fi
+          if [[ -z "$remote_tag" ]]; then
+            if ! gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="$RELEASE_COMMIT" > created-tag.json; then
+              concurrent_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
+                $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+                $2 == "refs/tags/" tag { direct = $1 }
+                END { print (peeled != "" ? peeled : direct) }
+              ')"
+              if [[ "$concurrent_tag" != "$RELEASE_COMMIT" ]]; then
+                echo "Failed to create the verified release tag" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "release_id=$(jq -r '.id' draft-release.json)" >> "$GITHUB_OUTPUT"
+          rm -f release-pages.json draft-matches.json draft-release.json created-tag.json
 
       - name: Publish verified draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          RELEASE_ID: ${{ steps.verified_draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false > published-release.json
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$RELEASE_COMMIT" \
+            '.draft == false and .tag_name == $tag and .target_commitish == $commit' \
+            published-release.json > /dev/null
+
+          published_tag=""
+          for _attempt in 1 2 3 4 5; do
+            published_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
+              $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+              $2 == "refs/tags/" tag { direct = $1 }
+              END { print (peeled != "" ? peeled : direct) }
+            ')"
+            [[ -n "$published_tag" ]] && break
+            sleep 2
+          done
+          if [[ "$published_tag" != "$RELEASE_COMMIT" ]]; then
+            echo "Published release tag does not point to the verified commit" >&2
+            exit 1
+          fi

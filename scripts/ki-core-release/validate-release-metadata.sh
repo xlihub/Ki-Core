@@ -143,6 +143,7 @@ if history_path is not None:
 seen_versions = set()
 seen_tags = set()
 entries_by_version = {}
+previous_version = None
 for entry in versions:
     if not isinstance(entry, dict):
         raise SystemExit("Each Ki-Core version mapping must be an object")
@@ -153,6 +154,9 @@ for entry in versions:
         raise SystemExit("Each Ki-Core mapping version must use X.Y.Z")
     if version in seen_versions:
         raise SystemExit(f"Duplicate Ki-Core version: {version}")
+    version_tuple = tuple(int(part) for part in version.split("."))
+    if previous_version is not None and version_tuple <= previous_version:
+        raise SystemExit("Ki-Core versions must be appended in strictly increasing SemVer order")
     if tag != f"ki-core-v{version}":
         raise SystemExit(f"Ki-Core {version} must use tag ki-core-v{version}")
     if tag in seen_tags:
@@ -166,6 +170,7 @@ for entry in versions:
     seen_versions.add(version)
     seen_tags.add(tag)
     entries_by_version[version] = entry
+    previous_version = version_tuple
 
 seen_statuses = set()
 last_status_rank = {}

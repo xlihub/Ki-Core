@@ -71,6 +71,8 @@ def validate_archive(path: pathlib.Path, executable: str) -> None:
             fail(f"Invalid release archive {path.name}: {error}")
         if len(members) != 1 or members[0].name != executable or not members[0].isfile():
             fail(f"Archive {path.name} must contain exactly one regular executable named {executable}")
+        if members[0].mode & 0o111 == 0:
+            fail(f"Archive {path.name} executable is missing Unix execute permissions")
     elif path.name.endswith(".zip"):
         try:
             with zipfile.ZipFile(path) as archive:

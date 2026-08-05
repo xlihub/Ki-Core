@@ -99,6 +99,31 @@ run_expect 0 "Built stable Ki-Core release manifest" \
     "$builder" stable "$stable_dir"
 run_expect 0 "Verified stable Ki-Core release assets" "$verifier" stable "$stable_dir"
 
+non_executable_dir="$tmpdir/non-executable"
+create_archives "$non_executable_dir" linux-x64
+python3 - "$non_executable_dir" <<'PY'
+import io
+import pathlib
+import tarfile
+import sys
+
+archive_path = next(pathlib.Path(sys.argv[1]).glob("*.tar.gz"))
+with tarfile.open(archive_path, "r:gz") as archive:
+    member = archive.getmembers()[0]
+    payload = archive.extractfile(member).read()
+member.mode = 0o644
+with tarfile.open(archive_path, "w:gz") as archive:
+    archive.addfile(member, io.BytesIO(payload))
+PY
+run_expect 0 "Built candidate Ki-Core release manifest" \
+    env \
+    KI_CORE_REPOSITORY=xlihub/Ki-Core \
+    KI_CORE_WORKFLOW=build-manual.yml \
+    KI_CORE_RUN_ID=1003 \
+    KI_CORE_HEAD_SHA="$release_commit" \
+    "$builder" candidate "$non_executable_dir"
+run_expect 1 "missing Unix execute permissions" "$verifier" candidate "$non_executable_dir"
+
 python3 - "$stable_dir/ki-core-release.json" <<'PY'
 import json
 import pathlib

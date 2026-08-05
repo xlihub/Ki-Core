@@ -44,6 +44,21 @@ for platform in (
 ):
     require(candidate, f'"platform":"{platform}"', f"candidate platform {platform}")
 
+stable_platforms = (
+    "macos-x64",
+    "macos-arm64",
+    "linux-x64",
+    "linux-arm64",
+    "windows-x64",
+    "windows-arm64",
+)
+stable_matrix = re.search(r"matrix:\n\s+include:\n(?P<body>.*?)(?=\n\s+steps:)", stable, re.DOTALL)
+if stable_matrix is None:
+    raise SystemExit("Stable release workflow must define an explicit platform matrix")
+actual_stable_platforms = re.findall(r"^\s+- platform: ([a-z0-9-]+)$", stable_matrix.group("body"), re.MULTILINE)
+if tuple(actual_stable_platforms) != stable_platforms:
+    raise SystemExit("Stable release workflow must build the exact six canonical platforms in order")
+
 for pattern, description in [
     ("tag_name:", "stable tag input"),
     ("release_commit:", "stable commit input"),
@@ -56,7 +71,12 @@ for pattern, description in [
     ('KI_CORE_WORKFLOW: release.yml', "stable workflow provenance"),
     ("Create draft with Release Please", "protected draft creation"),
     ("skip-github-pull-request: true", "Release Please release-only mode"),
-    ('gh release edit "$RELEASE_TAG" --draft=false', "draft promotion"),
+    ('releases?per_page=100', "paginated draft lookup"),
+    ('releases/${RELEASE_ID}', "release ID draft promotion"),
+    ('-F draft=false', "draft promotion"),
+    ('releases/assets/${asset_id}', "release asset ID download"),
+    ('published_tag', "published tag target verification"),
+    ('repos/${GITHUB_REPOSITORY}/git/refs', "atomic verified tag creation"),
     ('actions/workflows/build-manual.yml', "candidate workflow identity check"),
     ('.conclusion == "success"', "candidate conclusion check"),
     ('.head_sha == $release_commit', "candidate head SHA check"),
@@ -71,6 +91,10 @@ for pattern, description in [
     ('tags:\n', "tag push trigger"),
     ("workflow_call:", "reusable publication trigger"),
     ('ref: refs/tags/', "pre-existing tag checkout"),
+    ('releases/tags/${RELEASE_TAG}', "published-only tag lookup for a draft"),
+    ('gh release upload', "tag-based draft asset upload"),
+    ('gh release download', "tag-based draft asset download"),
+    ('gh release edit', "tag-based draft publication"),
 ]:
     forbid(stable, pattern, description)
 

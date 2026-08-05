@@ -30,13 +30,16 @@ expected = {
     "include-component-in-tag": True,
     "include-v-in-tag": True,
     "tag-separator": "-",
-    "release-as": "0.1.0",
+    "initial-version": "0.1.0",
     "draft": True,
     "force-tag-creation": False,
 }
 for key, value in expected.items():
     if package.get(key) != value:
         raise SystemExit(f"Release Please package field {key} must be {value!r}")
+
+if "release-as" in package:
+    raise SystemExit("Release Please must not persist a release-as override across release cycles")
 
 if package.get("extra-files"):
     raise SystemExit("Release Please must not update Cargo or other AionCore version files")

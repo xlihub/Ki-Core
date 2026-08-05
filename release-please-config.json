@@ -10,7 +10,7 @@
       "include-component-in-tag": true,
       "include-v-in-tag": true,
       "tag-separator": "-",
-      "release-as": "0.1.0",
+      "initial-version": "0.1.0",
       "draft": true,
       "force-tag-creation": false,
       "bump-minor-pre-major": true,

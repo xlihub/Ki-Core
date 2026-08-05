@@ -73,15 +73,6 @@ if [[ "$mapped_tag" != "$aioncore_tag" || "$mapped_commit" != "$aioncore_commit"
     exit 1
 fi
 
-if ! resolved_commit="$(git -C "$repo_root" rev-parse --verify "${aioncore_tag}^{commit}" 2>/dev/null)"; then
-    echo "Mapped AionCore tag is not available locally: $aioncore_tag" >&2
-    exit 1
-fi
-if [[ "$resolved_commit" != "$aioncore_commit" ]]; then
-    echo "AionCore tag $aioncore_tag does not match requested commit $aioncore_commit" >&2
-    exit 1
-fi
-
 backup_file="$(mktemp)"
 cp "$versions_file" "$backup_file"
 cleanup() {

@@ -81,7 +81,7 @@ jobs:
           aioncore_tag="$(jq -er '.tag' ki-core-upstream.json)"
           aioncore_commit="$(jq -er '.peeledCommit' ki-core-upstream.json)"
 
-          scripts/ki-core-release/update-release-map.sh \
+          KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/update-release-map.sh \
             "$ki_core_version" \
             "$aioncore_tag" \
             "$aioncore_commit"

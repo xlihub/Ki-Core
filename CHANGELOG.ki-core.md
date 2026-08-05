@@ -17,7 +17,6 @@
 * **release:** harden draft publication lifecycle ([fb9383f](https://github.com/xlihub/Ki-Core/commit/fb9383f290f1917cab1b1c9f7c9621a1f6e04b7d))
 * **release:** validate generated manifests efficiently ([81b66ca](https://github.com/xlihub/Ki-Core/commit/81b66ca7b04406d787360559e7269e7402f8e3d5))
 * **release:** validate map updates against remote tags ([3e43d49](https://github.com/xlihub/Ki-Core/commit/3e43d4959157641b1572f550e02ccf86839b8b71))
-* **release:** validate map updates against remote tags ([dec8a96](https://github.com/xlihub/Ki-Core/commit/dec8a964229ad979659ba28f0019fb28a03e6e18))
 * **release:** validate remote tags without local refs ([c6330ca](https://github.com/xlihub/Ki-Core/commit/c6330ca34ab8396b8e1d7a4ee356ad15336a8a89))
 
 ## Ki-Core Changelog

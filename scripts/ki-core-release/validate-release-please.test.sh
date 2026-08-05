@@ -31,7 +31,8 @@ expected = {
     "include-v-in-tag": True,
     "tag-separator": "-",
     "release-as": "0.1.0",
-    "skip-github-release": True,
+    "draft": True,
+    "force-tag-creation": False,
 }
 for key, value in expected.items():
     if package.get(key) != value:

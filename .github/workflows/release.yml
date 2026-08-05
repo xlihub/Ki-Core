@@ -1,106 +1,190 @@
-name: Release
+name: Ki-Core Stable Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_call:
-    inputs:
-      tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.0)"
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to build and publish (e.g., v0.2.0)"
+        description: Ki-Core stable tag, for example ki-core-v0.1.0
         required: true
         type: string
+      release_commit:
+        description: Full verified product/main commit SHA
+        required: true
+        type: string
+      candidate_run_id:
+        description: Successful all-platform candidate workflow run ID
+        required: true
+        type: string
+      confirm_publish:
+        description: Request protected draft creation and publication
+        required: true
+        type: boolean
+        default: false
 
-permissions:
-  contents: write
+permissions: read-all
+
+concurrency:
+  group: ki-core-stable-release
+  cancel-in-progress: false
 
 env:
-  BINARY_NAME: aioncore
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: "600"
   CARGO_NET_RETRY: "10"
-  # cross commit used by the v0.1.39/v0.1.40 Linux ARM64 release builds.
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
   LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
-  RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
 jobs:
-  prepare-release:
-    name: Prepare Release Metadata
+  prepare:
+    name: Validate Stable Release Request
+    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && github.ref == 'refs/heads/product/main' && inputs.confirm_publish
     runs-on: ubuntu-latest
-    # Fork safety: release jobs remain disabled until the repository variable is enabled.
-    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true'
+    permissions:
+      actions: read
+      contents: read
     outputs:
-      version: ${{ steps.metadata.outputs.version }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          ref: ${{ inputs.release_commit }}
 
-      - name: Extract version from tag
-        id: metadata
-        shell: bash
+      - name: Validate tag, commit, mapping, and candidate run
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
-          version="${RELEASE_TAG#v}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^ki-core-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "tag_name must use ki-core-vX.Y.Z" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_commit must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "candidate_run_id must be numeric" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#ki-core-v}"
+          if [[ "$(tr -d '[:space:]' < ki-core-version.txt)" != "$version" ]]; then
+            echo "tag_name does not match ki-core-version.txt" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_COMMIT" ]]; then
+            echo "Checked-out commit does not match release_commit" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin product/main
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$RELEASE_COMMIT" ]]; then
+            echo "release_commit is not the current product/main head" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/validate-release-metadata.sh
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build-manual.yml" > candidate-workflow.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" > candidate-run.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg release_commit "$RELEASE_COMMIT" \
+            --argjson workflow_id "$(jq -r '.id' candidate-workflow.json)" \
+            '.repository.full_name == $repository
+              and .workflow_id == $workflow_id
+              and .event == "workflow_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"
+              and .head_branch == "product/main"
+              and .head_sha == $release_commit' \
+            candidate-run.json > /dev/null
+
+          expected_artifacts="$(printf '%s\n' \
+            ki-core-candidate-linux-arm64 \
+            ki-core-candidate-linux-x64 \
+            ki-core-candidate-macos-arm64 \
+            ki-core-candidate-macos-x64 \
+            ki-core-candidate-windows-arm64 \
+            ki-core-candidate-windows-x64)"
+          actual_artifacts="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | .name' | sort)"
+          if [[ "$actual_artifacts" != "$expected_artifacts" ]]; then
+            echo "Candidate run does not contain the exact six canonical artifacts" >&2
+            diff -u <(printf '%s\n' "$expected_artifacts") <(printf '%s\n' "$actual_artifacts") || true
+            exit 1
+          fi
+
+          rm candidate-workflow.json candidate-run.json
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build Stable ${{ matrix.platform }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
-    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64: build natively on ubuntu-22.04 (GLIBC 2.35) so the
-          # release binary runs on Debian 12 / Ubuntu 22.04+ / RHEL 9 /
-          # CentOS Stream 9. We cannot use `cross` here because the default
-          # cross docker image ships a gcc that aws-lc-sys's memcmp safety
-          # check rejects. Pinning the runner is simpler and covers the
-          # target audience — Debian 11 (GLIBC 2.31) is entering ELTS so we
-          # deliberately drop it.
-          - os: ubuntu-22.04
+          - platform: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: aioncore
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: aioncore
+          - platform: linux-x64
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary_name: aioncore
-          # Linux aarch64: keep `cross` (its image happens to not trip the
-          # aws-lc-sys check and also yields an older GLIBC baseline).
-          - os: ubuntu-latest
+          - platform: linux-arm64
+            os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             binary_name: aioncore
             use_cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: aioncore
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            binary_name: aioncore
-          - os: windows-latest
+          - platform: windows-x64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: aioncore.exe
             rustflags: "-C target-feature=+crt-static"
-          - os: windows-latest
+          - platform: windows-arm64
+            os: windows-latest
             target: aarch64-pc-windows-msvc
             binary_name: aioncore.exe
             rustflags: "-C target-feature=+crt-static"
-
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Verify checked-out release commit
+        shell: bash
+        env:
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      - name: Fix MSVC linker (remove Git's link.exe)
+      - name: Fix MSVC linker
         if: runner.os == 'Windows'
         shell: pwsh
         run: Remove-Item 'C:\Program Files\Git\usr\bin\link.exe' -Force -ErrorAction SilentlyContinue
@@ -108,19 +192,13 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Include runner OS image and cross baseline in the cache key.
-          # Proc-macro .so files link against the host GLIBC, so switching
-          # the runner (ubuntu-24.04 ↔ 22.04) or flipping native ↔ cross
-          # must fall into a different cache bucket — otherwise the cached
-          # .so is loaded against an incompatible GLIBC and cargo panics
-          # with "can't find crate" / "GLIBC_* not found" errors.
-          shared-key: release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: ki-core-stable-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
-      - name: Verify pinned Linux ARM64 cross image is available
+      - name: Verify pinned Linux ARM64 cross image
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: docker pull ghcr.io/cross-rs/aarch64-unknown-linux-gnu@sha256:99e041b94e7d4f31477c6ddede176688562c3762ba3833b75de3316100afc39d
 
-      - name: Install cross (Linux targets)
+      - name: Install cross
         if: matrix.use_cross == true
         run: cargo install cross --git https://github.com/cross-rs/cross --rev "${CROSS_GIT_REV}" --locked
 
@@ -129,13 +207,11 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: |
-          if [[ -n "${RUSTFLAGS:-}" ]]; then
-            echo "Using RUSTFLAGS=${RUSTFLAGS}"
-          fi
+          set -euo pipefail
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} -p aionui-app
+            cross build --release --target "${{ matrix.target }}" -p aionui-app
           else
-            cargo build --release --target ${{ matrix.target }} -p aionui-app
+            cargo build --release --target "${{ matrix.target }}" -p aionui-app
           fi
 
       - name: Verify Linux ARM64 GLIBC baseline
@@ -148,68 +224,209 @@ jobs:
         shell: bash
         run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
 
-      - name: Package binary (Unix)
+      - name: Package stable archive
         if: runner.os != 'Windows'
         shell: bash
         env:
-          VERSION: ${{ needs.prepare-release.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          archive="ki-core-v${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
-          ARCHIVE="aioncore-v${VERSION}-${{ matrix.target }}.tar.gz"
-          tar -C target/${{ matrix.target }}/release -czf "dist/${ARCHIVE}" ${{ matrix.binary_name }}
-          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$archive" "${{ matrix.binary_name }}"
 
-      - name: Package binary (Windows)
+      - name: Package stable archive
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VERSION: ${{ needs.prepare-release.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          $archive = "ki-core-v${env:VERSION}-${{ matrix.target }}.zip"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $archive = "aioncore-v${env:VERSION}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
-          "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}"
 
-      - name: Upload release artifact
+      - name: Upload stable build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
-          path: dist/${{ env.ARCHIVE }}
+          name: ki-core-stable-${{ matrix.platform }}
+          path: dist/*
           if-no-files-found: error
 
-  github-release:
-    name: Upload GitHub Release assets
+  assemble:
+    name: Assemble and Verify Stable Assets
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    needs:
-      - prepare-release
-      - build
+    permissions:
+      contents: read
     steps:
-      - name: Download build artifacts
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Download six stable archives
         uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          pattern: ki-core-stable-*
+          path: release-assets
           merge-multiple: true
 
-      - name: Generate checksums
-        shell: bash
+      - name: Build and verify stable manifest
+        env:
+          KI_CORE_REPOSITORY: ${{ github.repository }}
+          KI_CORE_WORKFLOW: release.yml
+          KI_CORE_RUN_ID: ${{ github.run_id }}
+          KI_CORE_HEAD_SHA: ${{ needs.prepare.outputs.commit }}
+          KI_CORE_RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          KI_CORE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          cd artifacts
-          sha256sum aioncore-* > aioncore-checksums.txt
+          scripts/ki-core-release/build-release-manifest.sh stable release-assets
+          scripts/ki-core-release/verify-release-assets.sh stable release-assets
 
-      - name: Upload release assets
-        shell: bash
+      - name: Upload verified stable asset set
+        uses: actions/upload-artifact@v7
+        with:
+          name: ki-core-stable-assets-${{ github.run_id }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Verified Stable Release
+    needs: [prepare, assemble]
+    runs-on: ubuntu-latest
+    environment: ki-core-stable
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Download verified stable asset set
+        uses: actions/download-artifact@v8
+        with:
+          name: ki-core-stable-assets-${{ github.run_id }}
+          path: release-assets
+
+      - name: Reverify assets before any GitHub mutation
+        run: scripts/ki-core-release/verify-release-assets.sh stable release-assets
+
+      - name: Inspect existing draft
+        id: draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
-          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
-          release_url="https://github.com/${REPOSITORY}/releases/tag/${RELEASE_TAG}"
-          if gh release view "${RELEASE_TAG}" --repo "${REPOSITORY}" > /dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" artifacts/* --repo "${REPOSITORY}" --clobber
+          set -euo pipefail
+
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > draft-release.json 2>draft-error.txt; then
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              --arg commit "$RELEASE_COMMIT" \
+              '.draft == true and .tag_name == $tag and .target_commitish == $commit' \
+              draft-release.json > /dev/null
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif grep -q "HTTP 404" draft-error.txt; then
+            if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+              echo "Release tag already exists without a matching draft" >&2
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            gh release create "${RELEASE_TAG}" artifacts/* \
-              --repo "${REPOSITORY}" \
-              --title "${RELEASE_TAG}" \
-              --generate-notes
+            cat draft-error.txt >&2
+            exit 1
           fi
-          echo "Uploaded assets to ${release_url}"
+
+          rm -f draft-release.json draft-error.txt
+
+      - name: Create draft with Release Please
+        if: steps.draft.outputs.exists == 'false'
+        id: release-please
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: product/main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Validate Release Please draft output
+        if: steps.draft.outputs.exists == 'false'
+        env:
+          CREATED: ${{ steps.release-please.outputs.release_created }}
+          CREATED_TAG: ${{ steps.release-please.outputs.tag_name }}
+          CREATED_SHA: ${{ steps.release-please.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          if [[ "$CREATED" != "true" || "$CREATED_TAG" != "$RELEASE_TAG" || "$CREATED_SHA" != "$RELEASE_COMMIT" ]]; then
+            echo "Release Please created an unexpected draft identity" >&2
+            exit 1
+          fi
+
+      - name: Upload only missing assets and verify existing hashes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > draft-release.json
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$RELEASE_COMMIT" \
+            '.draft == true and .tag_name == $tag and .target_commitish == $commit' \
+            draft-release.json > /dev/null
+
+          mapfile -t expected_assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          mapfile -t remote_assets < <(jq -r '.assets[].name' draft-release.json | sort)
+          if [[ "$(printf '%s\n' "${remote_assets[@]}" | sed '/^$/d' | wc -l | tr -d ' ')" != "$(printf '%s\n' "${remote_assets[@]}" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" ]]; then
+            echo "Draft contains duplicate asset names" >&2
+            exit 1
+          fi
+          declare -A expected_names=()
+          for asset_path in "${expected_assets[@]}"; do
+            expected_names["$(basename "$asset_path")"]="$asset_path"
+          done
+          for remote_name in "${remote_assets[@]}"; do
+            if [[ -z "${expected_names[$remote_name]:-}" ]]; then
+              echo "Draft contains unexpected asset: $remote_name" >&2
+              exit 1
+            fi
+          done
+
+          mkdir existing-assets
+          upload_args=()
+          for asset_path in "${expected_assets[@]}"; do
+            asset_name="$(basename "$asset_path")"
+            if printf '%s\n' "${remote_assets[@]}" | grep -Fxq "$asset_name"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$asset_name" --dir existing-assets
+              if [[ "$(sha256sum "$asset_path" | awk '{print $1}')" != "$(sha256sum "existing-assets/$asset_name" | awk '{print $1}')" ]]; then
+                echo "Existing draft asset hash does not match: $asset_name" >&2
+                exit 1
+              fi
+            else
+              upload_args+=("$asset_path")
+            fi
+          done
+          if (( ${#upload_args[@]} > 0 )); then
+            gh release upload "$RELEASE_TAG" "${upload_args[@]}" --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Download and verify the populated draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          mkdir verified-draft
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir verified-draft
+          scripts/ki-core-release/verify-release-assets.sh stable verified-draft
+
+      - name: Publish verified draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"

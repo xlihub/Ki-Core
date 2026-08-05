@@ -23,6 +23,9 @@ jobs:
       - run: bash scripts/migration/check-immutability.sh
       - run: bash scripts/ki-core-release/validate-release-metadata.test.sh
       - run: KI_CORE_VERIFY_REMOTE_TAG=1 bash scripts/ki-core-release/validate-release-metadata.sh
+      - run: bash scripts/ki-core-release/validate-release-please.test.sh
+      - run: bash scripts/ki-core-release/verify-release-assets.test.sh
+      - run: bash scripts/ki-core-release/validate-release-workflows.test.sh
 
   fmt:
     name: Format

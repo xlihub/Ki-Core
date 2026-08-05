@@ -1,22 +1,20 @@
 {
-  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "simple",
-  "include-v-in-tag": true,
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "bootstrap-sha": "532d7fffdb99c4370bb4569fe9179e44980fca15",
   "packages": {
     ".": {
-      "package-name": "aioncore",
-      "include-component-in-tag": false,
+      "package-name": "ki-core",
       "release-type": "simple",
-      "changelog-path": "CHANGELOG.md",
+      "version-file": "ki-core-version.txt",
+      "changelog-path": "CHANGELOG.ki-core.md",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "initial-version": "0.1.0",
+      "draft": true,
+      "force-tag-creation": false,
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
-      "extra-files": [
-        {
-          "type": "toml",
-          "path": "Cargo.toml",
-          "jsonpath": "$.workspace.package.version"
-        }
-      ]
+      "bump-patch-for-minor-pre-major": false
     }
   },
   "changelog-sections": [

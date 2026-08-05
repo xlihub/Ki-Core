@@ -2,77 +2,112 @@ name: Release Please
 
 on:
   push:
-    branches:
-      - product/main
+    branches: [product/main]
+  workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
+concurrency:
+  group: release-please-product-main
+  cancel-in-progress: false
 
 jobs:
-  release:
+  release-pr:
+    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && github.ref == 'refs/heads/product/main'
     runs-on: ubuntu-latest
-    if: "vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && (startsWith(github.event.head_commit.message, 'chore: release') || startsWith(github.event.head_commit.message, 'chore(main): release'))"
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      - uses: googleapis/release-please-action@v5
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          skip-github-pull-request: true
-
-      - name: Trigger Release build workflow
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Release created: ${{ steps.release.outputs.tag_name }}"
-          gh workflow run release.yml \
-            --repo "${{ github.repository }}" \
-            --field "tag_name=${{ steps.release.outputs.tag_name }}"
-
-  update-pr:
-    runs-on: ubuntu-latest
-    if: "vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && !startsWith(github.event.head_commit.message, 'chore: release') && !startsWith(github.event.head_commit.message, 'chore(main): release')"
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
     steps:
       - uses: googleapis/release-please-action@v5
         id: release-please
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: product/main
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-release: true
 
-      - name: Checkout release PR branch
-        if: steps.release-please.outputs.pr
+      - name: Read and validate release PR identity
+        if: steps.release-please.outputs.prs_created == 'true'
+        id: release-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release-please.outputs.pr }}
+        run: |
+          set -euo pipefail
+
+          release_branch="$(jq -r '.headBranchName // empty' <<< "$RELEASE_PR")"
+          release_pr_number="$(jq -r '.number // empty' <<< "$RELEASE_PR")"
+          if [[ -z "$release_branch" || ! "$release_pr_number" =~ ^[0-9]+$ ]]; then
+            echo "Release Please did not return a valid PR identity" >&2
+            exit 1
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${release_pr_number}" > release-pr.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg branch "$release_branch" \
+            '.state == "open"
+              and .base.ref == "product/main"
+              and .head.repo.full_name == $repository
+              and .head.ref == $branch' \
+            release-pr.json > /dev/null
+
+          echo "branch=$release_branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$(jq -r '.head.sha' release-pr.json)" >> "$GITHUB_OUTPUT"
+          rm release-pr.json
+
+      - name: Checkout exact release PR branch
+        if: steps.release-please.outputs.prs_created == 'true'
         uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           ref: ${{ fromJSON(steps.release-please.outputs.pr).headBranchName }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust toolchain
-        if: steps.release-please.outputs.pr
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95.0"
+      - name: Verify checked-out release PR commit
+        if: steps.release-please.outputs.prs_created == 'true'
+        env:
+          EXPECTED_SHA: ${{ steps.release-pr.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
-      - name: Update Cargo.lock for workspace version bump
-        if: steps.release-please.outputs.pr
-        run: cargo update --workspace
-
-      - name: Commit and push Cargo.lock if changed
-        if: steps.release-please.outputs.pr
+      - name: Update and validate Ki-Core release mapping
+        if: steps.release-please.outputs.prs_created == 'true'
         run: |
-          if git diff --quiet Cargo.lock; then
-            echo "Cargo.lock is already up to date"
+          set -euo pipefail
+
+          ki_core_version="$(tr -d '[:space:]' < ki-core-version.txt)"
+          aioncore_tag="$(jq -er '.tag' ki-core-upstream.json)"
+          aioncore_commit="$(jq -er '.peeledCommit' ki-core-upstream.json)"
+
+          scripts/ki-core-release/update-release-map.sh \
+            "$ki_core_version" \
+            "$aioncore_tag" \
+            "$aioncore_commit"
+          KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/validate-release-metadata.sh
+
+      - name: Commit release mapping update
+        if: steps.release-please.outputs.prs_created == 'true'
+        env:
+          RELEASE_BRANCH: ${{ steps.release-pr.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          release_branch="$RELEASE_BRANCH"
+          if git diff --quiet -- ki-core-versions.json; then
+            echo "Ki-Core release mapping is already current"
           else
             git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
-            git commit -m "chore: update Cargo.lock for workspace version bump"
-            git push
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ki-core-versions.json
+            git commit -m "chore(release): update Ki-Core version mapping"
+            git push origin "HEAD:$release_branch"
           fi
+
+      - name: Dispatch CI for release PR head
+        if: steps.release-please.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ steps.release-pr.outputs.branch }}
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$RELEASE_BRANCH"

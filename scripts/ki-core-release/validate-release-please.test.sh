@@ -4,15 +4,60 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-python3 - release-please-config.json .release-please-manifest.json <<'PY'
+python3 - release-please-config.json .release-please-manifest.json ki-core-version.txt <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 config_path = pathlib.Path(sys.argv[1])
 manifest_path = pathlib.Path(sys.argv[2])
+version_path = pathlib.Path(sys.argv[3])
 config = json.loads(config_path.read_text())
 manifest = json.loads(manifest_path.read_text())
+current_version = version_path.read_text().strip()
+
+stable_semver = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+
+class ContractError(ValueError):
+    pass
+
+
+def parse_stable_semver(value: object, field: str) -> tuple[int, int, int]:
+    if not isinstance(value, str):
+        raise ContractError(f"{field} must be a stable SemVer string")
+    match = stable_semver.fullmatch(value)
+    if match is None:
+        raise ContractError(f"{field} must be a stable SemVer string")
+    return tuple(int(part) for part in match.groups())
+
+
+def validate_manifest_state(
+    candidate_manifest: object,
+    candidate_version: object,
+    initial_version: str,
+) -> None:
+    current = parse_stable_semver(candidate_version, "ki-core-version.txt")
+    initial = parse_stable_semver(initial_version, "Release Please initial-version")
+    if current < initial:
+        raise ContractError("ki-core-version.txt must not precede the initial Ki-Core version")
+
+    if not isinstance(candidate_manifest, dict) or set(candidate_manifest) != {"."}:
+        raise ContractError("Release Please manifest must contain only the repository root package")
+
+    manifest_version = candidate_manifest["."]
+    manifest_semver = parse_stable_semver(
+        manifest_version,
+        "Release Please manifest root version",
+    )
+    if manifest_version == "0.0.0":
+        if current != initial:
+            raise ContractError("The bootstrap manifest is valid only before the initial release")
+        return
+
+    if manifest_semver != current:
+        raise ContractError("Release Please manifest must match ki-core-version.txt after bootstrap")
 
 expected_bootstrap_sha = "532d7fffdb99c4370bb4569fe9179e44980fca15"
 if config.get("bootstrap-sha") != expected_bootstrap_sha:
@@ -43,14 +88,38 @@ if "release-as" in package:
 
 if package.get("extra-files"):
     raise SystemExit("Release Please must not update Cargo or other AionCore version files")
-if manifest != {".": "0.0.0"}:
-    raise SystemExit("The bootstrap manifest must start before Ki-Core 0.1.0")
-PY
 
-if [[ "$(tr -d '[:space:]' < ki-core-version.txt)" != "0.1.0" ]]; then
-    echo "ki-core-version.txt must hold the prepared 0.1.0 product version" >&2
-    exit 1
-fi
+initial_version = expected["initial-version"]
+try:
+    validate_manifest_state(manifest, current_version, initial_version)
+except ContractError as error:
+    raise SystemExit(str(error)) from error
+
+valid_states = (
+    ({".": "0.0.0"}, "0.1.0"),
+    ({".": "0.1.0"}, "0.1.0"),
+    ({".": "1.4.2"}, "1.4.2"),
+)
+for candidate_manifest, candidate_version in valid_states:
+    validate_manifest_state(candidate_manifest, candidate_version, initial_version)
+
+invalid_states = (
+    ({".": "0.0.0"}, "0.2.0"),
+    ({".": "0.1.0", "other": "0.1.0"}, "0.1.0"),
+    ({".": "0.1"}, "0.1.0"),
+    ({".": "0.1.0"}, "0.2.0"),
+    ({".": "0.1.0"}, "0.1.0-rc.1"),
+)
+for candidate_manifest, candidate_version in invalid_states:
+    try:
+        validate_manifest_state(candidate_manifest, candidate_version, initial_version)
+    except ContractError:
+        continue
+    raise SystemExit(
+        f"Release Please manifest validator accepted invalid state: "
+        f"{candidate_manifest!r}, {candidate_version!r}"
+    )
+PY
 
 if [[ ! -f CHANGELOG.ki-core.md ]]; then
     echo "CHANGELOG.ki-core.md must exist" >&2

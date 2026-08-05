@@ -6,6 +6,8 @@ build_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile
 install_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/install.ps1" } else { "bash scripts/just/install.sh" }
 migration_check_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.ps1" } else { "bash scripts/migration/check-immutability.sh" }
 migration_check_test_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/migration/check-immutability.test.ps1" } else { "bash scripts/migration/check-immutability.test.sh" }
+release_metadata_check_script := if os_family() == "windows" { "bash scripts/ki-core-release/validate-release-metadata.sh" } else { "bash scripts/ki-core-release/validate-release-metadata.sh" }
+release_metadata_test_script := if os_family() == "windows" { "bash scripts/ki-core-release/validate-release-metadata.test.sh" } else { "bash scripts/ki-core-release/validate-release-metadata.test.sh" }
 auto_commit_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/auto-commit-fixes.ps1" } else { "bash scripts/just/auto-commit-fixes.sh" }
 update_aionrs_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/update-aionrs.ps1" } else { "bash scripts/just/update-aionrs.sh" }
 cat_config_script := if os_family() == "windows" { "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/just/cat-config.ps1" } else { "bash scripts/just/cat-config.sh" }
@@ -47,6 +49,14 @@ migration-check:
 migration-check-test:
     @{{migration_check_test_script}}
 
+# Validate Ki-Core product version, upstream mapping, and source parity
+release-metadata-check:
+    @{{release_metadata_check_script}}
+
+# Test the Ki-Core release metadata validator and mapping updater
+release-metadata-check-test:
+    @{{release_metadata_test_script}}
+
 # Lint (warnings = errors)
 lint:
     @just _cargo clippy --workspace -- -D warnings
@@ -64,7 +74,7 @@ fmt-check:
     @cargo fmt --all -- --check
 
 # Lint + format check + migration check + test
-check: migration-check lint fmt-check test
+check: migration-check release-metadata-check release-metadata-check-test lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:

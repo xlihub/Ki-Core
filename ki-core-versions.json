@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "versions": [
+    {
+      "version": "0.1.0",
+      "tag": "ki-core-v0.1.0",
+      "aionCore": {
+        "tag": "v0.1.58",
+        "peeledCommit": "134daddccf129d1642e08e709522f835fb734572"
+      }
+    }
+  ],
+  "statusHistory": [
+    {
+      "version": "0.1.0",
+      "status": "prepared",
+      "recordedAt": "2026-08-05"
+    }
+  ]
+}

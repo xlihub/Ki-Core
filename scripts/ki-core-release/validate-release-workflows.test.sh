@@ -4,13 +4,19 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-python3 - .github/workflows/build-manual.yml .github/workflows/release.yml <<'PY'
+python3 - \
+    .github/workflows/build-manual.yml \
+    .github/workflows/release.yml \
+    .github/workflows/ci.yml \
+    .github/workflows/release-please.yml <<'PY'
 import pathlib
 import re
 import sys
 
 candidate = pathlib.Path(sys.argv[1]).read_text()
 stable = pathlib.Path(sys.argv[2]).read_text()
+ci = pathlib.Path(sys.argv[3]).read_text()
+release_please = pathlib.Path(sys.argv[4]).read_text()
 
 
 def require(text: str, pattern: str, description: str) -> None:
@@ -100,6 +106,71 @@ for pattern, description in [
 
 if not re.search(r"on:\n  workflow_dispatch:\n", stable):
     raise SystemExit("Stable release workflow must be dispatch-only")
+
+test_job = re.search(r"^  test:\n(?P<body>.*?)(?=^  [a-z][a-z0-9_-]+:\n)", ci, re.DOTALL | re.MULTILINE)
+if test_job is None:
+    raise SystemExit("CI workflow must define a Test job")
+
+for pattern, description in [
+    ("force_workspace_test:", "manual workspace test override input"),
+    ("type: boolean", "Boolean manual workspace test override"),
+    ("default: true", "full workspace tests by default for manual CI"),
+    ("workspace: ${{ steps.filter.outputs.workspace }}", "workspace change output"),
+    ("dorny/paths-filter@v4", "Node 24 path filter"),
+    ("list-files: shell", "observable workspace path matches"),
+    ("'.cargo/**'", "Cargo configuration impact path"),
+    ("'.github/workflows/ci.yml'", "CI workflow self-validation path"),
+    ("'Cargo.toml'", "workspace manifest impact path"),
+    ("'Cargo.lock'", "dependency lock impact path"),
+    ("'rust-toolchain.toml'", "Rust toolchain impact path"),
+    ("'crates/**'", "workspace source and fixture impact path"),
+]:
+    require(ci, pattern, description)
+
+for pattern, description in [
+    ("needs: changes", "workspace change dependency"),
+    (
+        "needs.changes.outputs.workspace == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_workspace_test)",
+        "runtime changes or explicit manual override gate",
+    ),
+    ("cargo nextest run --workspace", "full workspace test command"),
+]:
+    require(test_job.group("body"), pattern, description)
+
+for pattern in (
+    "scripts/ki-core-release/**",
+    ".release-please-manifest.json",
+    "CHANGELOG.ki-core.md",
+):
+    forbid(ci, pattern, f"release-only path classified as workspace test input: {pattern}")
+
+require(
+    release_please,
+    "-f force_workspace_test=false",
+    "Release Please metadata-only CI dispatch",
+)
+
+
+def should_run_workspace_test(event: str, workspace_changed: bool, force: bool) -> bool:
+    return workspace_changed or (event == "workflow_dispatch" and force)
+
+
+expected_test_decisions = (
+    ("pull_request", True, False, True),
+    ("pull_request", False, False, False),
+    ("push", True, False, True),
+    ("push", False, False, False),
+    ("workflow_dispatch", True, False, True),
+    ("workflow_dispatch", False, False, False),
+    ("workflow_dispatch", False, True, True),
+)
+for event, workspace_changed, force, expected_decision in expected_test_decisions:
+    actual_decision = should_run_workspace_test(event, workspace_changed, force)
+    if actual_decision != expected_decision:
+        raise SystemExit(
+            "Workspace test decision mismatch for "
+            f"event={event}, workspace_changed={workspace_changed}, force={force}"
+        )
 
 print("Ki-Core release workflow contract tests passed")
 PY

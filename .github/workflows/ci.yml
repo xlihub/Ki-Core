@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [product/main]
   workflow_dispatch:
+    inputs:
+      force_workspace_test:
+        description: Run the full Rust workspace test when runtime files are unchanged
+        required: true
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,6 +61,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_workspace_test)
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -67,20 +75,46 @@ jobs:
       - run: cargo nextest run --workspace
 
   changes:
-    name: Detect dependency changes
+    name: Detect CI test changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       deps: ${{ steps.filter.outputs.deps }}
+      workspace: ${{ steps.filter.outputs.workspace }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
+          list-files: shell
           filters: |
+            workspace:
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'crates/**'
             deps:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/*/Cargo.toml'
+      - name: Summarize workspace test decision
+        if: always()
+        env:
+          WORKSPACE_CHANGED: ${{ steps.filter.outputs.workspace }}
+          WORKSPACE_FILES: ${{ steps.filter.outputs.workspace_files }}
+          FORCE_WORKSPACE_TEST: ${{ inputs.force_workspace_test }}
+        run: |
+          {
+            echo "### Workspace test decision"
+            echo ""
+            echo "- Runtime-impact files changed: \`${WORKSPACE_CHANGED:-false}\`"
+            echo "- Manual force input: \`${FORCE_WORKSPACE_TEST:-false}\`"
+            echo "- Matched files: \`${WORKSPACE_FILES:-none}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   audit:
     name: Security Audit

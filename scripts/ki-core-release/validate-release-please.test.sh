@@ -59,6 +59,8 @@ fi
 
 workflow=".github/workflows/release-please.yml"
 required_patterns=(
+    "workflow_dispatch:"
+    "github.ref == 'refs/heads/product/main'"
     "target-branch: product/main"
     "skip-github-release: true"
     "steps.release-please.outputs.prs_created == 'true'"

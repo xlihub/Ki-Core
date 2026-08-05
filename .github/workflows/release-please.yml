@@ -3,6 +3,7 @@ name: Release Please
 on:
   push:
     branches: [product/main]
+  workflow_dispatch:
 
 concurrency:
   group: release-please-product-main
@@ -10,7 +11,7 @@ concurrency:
 
 jobs:
   release-pr:
-    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true'
+    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && github.ref == 'refs/heads/product/main'
     runs-on: ubuntu-latest
     permissions:
       actions: write

@@ -65,7 +65,7 @@ required_patterns=(
     "skip-github-release: true"
     "steps.release-please.outputs.prs_created == 'true'"
     "fromJSON(steps.release-please.outputs.pr).headBranchName"
-    "scripts/ki-core-release/update-release-map.sh"
+    "KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/update-release-map.sh"
     "scripts/ki-core-release/validate-release-metadata.sh"
     "git push origin \"HEAD:\$release_branch\""
 )

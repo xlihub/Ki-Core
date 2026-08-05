@@ -150,6 +150,52 @@ run_expect "$remote_tag_repo" 0 "Ki-Core release metadata validation passed" \
     KI_CORE_VERIFY_REMOTE_TAG=1 \
     KI_CORE_RELEASE_HISTORY_REF=mapping-base \
     bash scripts/ki-core-release/validate-release-metadata.sh
+run_expect "$remote_tag_repo" 0 "Ki-Core 0.1.0 already matches the requested mapping" \
+    env \
+    PATH="$fake_git_dir:$PATH" \
+    KI_CORE_REAL_GIT="$real_git" \
+    KI_CORE_FAKE_REMOTE_COMMIT="$remote_tag_commit" \
+    KI_CORE_VERIFY_REMOTE_TAG=1 \
+    KI_CORE_RELEASE_HISTORY_REF=mapping-base \
+    bash scripts/ki-core-release/update-release-map.sh \
+    0.1.0 v0.1.58 "$remote_tag_commit"
+
+remote_update_repo="$(init_case_repo remote-update)"
+remote_update_commit="$(git -C "$remote_update_repo" rev-parse 'v0.1.58^{commit}')"
+printf '%s\n' '0.1.1' > "$remote_update_repo/ki-core-version.txt"
+git -C "$remote_update_repo" tag -d v0.1.58 v0.1.57 >/dev/null
+run_expect "$remote_update_repo" 0 "Added Ki-Core 0.1.1 mapping" \
+    env \
+    PATH="$fake_git_dir:$PATH" \
+    KI_CORE_REAL_GIT="$real_git" \
+    KI_CORE_FAKE_REMOTE_COMMIT="$remote_update_commit" \
+    KI_CORE_VERIFY_REMOTE_TAG=1 \
+    KI_CORE_RELEASE_HISTORY_REF=mapping-base \
+    KI_CORE_RECORDED_AT=2026-08-06 \
+    bash scripts/ki-core-release/update-release-map.sh \
+    0.1.1 v0.1.58 "$remote_update_commit"
+
+remote_update_mismatch_repo="$(init_case_repo remote-update-mismatch)"
+remote_update_mismatch_commit="$(git -C "$remote_update_mismatch_repo" rev-parse 'v0.1.58^{commit}')"
+printf '%s\n' '0.1.1' > "$remote_update_mismatch_repo/ki-core-version.txt"
+git -C "$remote_update_mismatch_repo" tag -d v0.1.58 v0.1.57 >/dev/null
+cp "$remote_update_mismatch_repo/ki-core-versions.json" "$tmpdir/remote-update-mismatch-versions.json"
+run_expect "$remote_update_mismatch_repo" 1 "Remote AionCore tag v0.1.58 does not match" \
+    env \
+    PATH="$fake_git_dir:$PATH" \
+    KI_CORE_REAL_GIT="$real_git" \
+    KI_CORE_FAKE_REMOTE_COMMIT=0000000000000000000000000000000000000000 \
+    KI_CORE_VERIFY_REMOTE_TAG=1 \
+    KI_CORE_RELEASE_HISTORY_REF=mapping-base \
+    KI_CORE_RECORDED_AT=2026-08-06 \
+    bash scripts/ki-core-release/update-release-map.sh \
+    0.1.1 v0.1.58 "$remote_update_mismatch_commit"
+if ! cmp -s \
+    "$tmpdir/remote-update-mismatch-versions.json" \
+    "$remote_update_mismatch_repo/ki-core-versions.json"; then
+    echo "Remote validation failure must restore ki-core-versions.json" >&2
+    exit 1
+fi
 
 tag_mismatch_repo="$(init_case_repo tag-mismatch)"
 python3 - "$tag_mismatch_repo/ki-core-upstream.json" <<'PY'

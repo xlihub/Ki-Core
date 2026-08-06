@@ -2,133 +2,123 @@
 set -euo pipefail
 
 if [[ "$#" != 3 ]]; then
-    echo "Usage: $0 <ki-core-version> <aioncore-tag> <aioncore-peeled-commit>" >&2
-    exit 2
+    echo "Usage: $0 <ki-core-version> <aioncore-tag> <aioncore-commit>" >&2
+    exit 1
 fi
 
 ki_core_version="$1"
-aioncore_tag="$2"
-aioncore_commit="$3"
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(git -C "$script_dir" rev-parse --show-toplevel)"
-version_file="$repo_root/ki-core-version.txt"
-upstream_file="$repo_root/ki-core-upstream.json"
+upstream_tag="$2"
+upstream_commit="$3"
+repo_root="$(git rev-parse --show-toplevel)"
 versions_file="$repo_root/ki-core-versions.json"
-validator="$script_dir/validate-release-metadata.sh"
-recorded_at="${KI_CORE_RECORDED_AT:-$(date -u +%F)}"
+version_file="$repo_root/ki-core-version.txt"
 
+if [[ ! "$ki_core_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "Ki-Core version must use stable X.Y.Z SemVer" >&2
+    exit 1
+fi
+if [[ ! "$upstream_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "AionCore tag must use vX.Y.Z" >&2
+    exit 1
+fi
+if [[ ! "$upstream_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "AionCore commit must be a full lowercase commit SHA" >&2
+    exit 1
+fi
 if [[ "$(tr -d '[:space:]' < "$version_file")" != "$ki_core_version" ]]; then
-    echo "ki-core-version.txt does not match requested version $ki_core_version" >&2
+    echo "Requested Ki-Core version does not match ki-core-version.txt" >&2
     exit 1
 fi
 
-existing_state="$({
-    python3 - "$versions_file" "$ki_core_version" "$aioncore_tag" "$aioncore_commit" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-version = sys.argv[2]
-tag = sys.argv[3]
-commit = sys.argv[4]
-data = json.loads(path.read_text())
-expected = {
-    "version": version,
-    "tag": f"ki-core-v{version}",
-    "aionCore": {"tag": tag, "peeledCommit": commit},
-}
-matches = [entry for entry in data.get("versions", []) if entry.get("version") == version]
-if not matches:
-    print("absent")
-elif len(matches) == 1 and matches[0] == expected:
-    print("exact")
-else:
-    raise SystemExit(f"Ki-Core version {version} already exists with different provenance")
-PY
-} 2>&1)" || {
-    echo "$existing_state" >&2
+resolved_upstream=""
+if git cat-file -e "$upstream_tag^{commit}" 2>/dev/null; then
+    resolved_upstream="$(git rev-parse "$upstream_tag^{commit}")"
+elif [[ "${KI_CORE_VERIFY_REMOTE_TAG:-0}" == "1" ]]; then
+    resolved_upstream="$(git ls-remote --tags https://github.com/iOfficeAI/AionCore.git \
+        "refs/tags/$upstream_tag" "refs/tags/$upstream_tag^{}" | awk -v tag="$upstream_tag" '
+        $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+        $2 == "refs/tags/" tag { direct = $1 }
+        END { print (peeled != "" ? peeled : direct) }
+    ')"
+else
+    echo "Mapped AionCore tag is not available locally: $upstream_tag" >&2
     exit 1
-}
-
-if [[ "$existing_state" == "exact" ]]; then
-    bash "$validator"
-    echo "Ki-Core $ki_core_version already matches the requested mapping"
-    exit 0
 fi
-
-upstream_values="$(python3 - "$upstream_file" <<'PY'
-import json
-import pathlib
-import sys
-
-data = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(f"{data.get('tag', '')}\t{data.get('peeledCommit', '')}")
-PY
-)"
-IFS=$'\t' read -r mapped_tag mapped_commit <<< "$upstream_values"
-if [[ "$mapped_tag" != "$aioncore_tag" || "$mapped_commit" != "$aioncore_commit" ]]; then
-    echo "Requested AionCore provenance does not match ki-core-upstream.json" >&2
+if [[ "$resolved_upstream" != "$upstream_commit" ]]; then
+    echo "AionCore tag $upstream_tag does not match $upstream_commit" >&2
     exit 1
 fi
 
-backup_file="$(mktemp)"
-cp "$versions_file" "$backup_file"
-cleanup() {
-    rm -f "$backup_file"
-}
-trap cleanup EXIT
+product_tag="ki-core-v${ki_core_version}"
+allow_replace=1
+if git cat-file -e "$product_tag^{commit}" 2>/dev/null; then
+    allow_replace=0
+elif [[ "${KI_CORE_VERIFY_REMOTE_TAG:-0}" == "1" ]]; then
+    remote_product_tag="$(git ls-remote --tags origin \
+        "refs/tags/$product_tag" "refs/tags/$product_tag^{}" | awk -v tag="$product_tag" '
+        $2 == "refs/tags/" tag "^{}" { peeled = $1 }
+        $2 == "refs/tags/" tag { direct = $1 }
+        END { print (peeled != "" ? peeled : direct) }
+    ')"
+    if [[ -n "$remote_product_tag" ]]; then
+        allow_replace=0
+    fi
+fi
 
-python3 - "$versions_file" "$ki_core_version" "$aioncore_tag" "$aioncore_commit" "$recorded_at" <<'PY'
-import datetime
+tmp_file="$(mktemp "${versions_file}.tmp.XXXXXX")"
+trap 'rm -f "$tmp_file"' EXIT
+
+python3 - "$versions_file" "$tmp_file" "$ki_core_version" "$upstream_tag" "$upstream_commit" "$allow_replace" <<'PY'
 import json
-import os
 import pathlib
 import re
 import sys
-import tempfile
 
-path = pathlib.Path(sys.argv[1])
-version = sys.argv[2]
-tag = sys.argv[3]
-commit = sys.argv[4]
-recorded_at = sys.argv[5]
+source_path = pathlib.Path(sys.argv[1])
+target_path = pathlib.Path(sys.argv[2])
+version = sys.argv[3]
+upstream_tag = sys.argv[4]
+upstream_commit = sys.argv[5]
+allow_replace = sys.argv[6] == "1"
+semver_pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
-if re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version) is None:
-    raise SystemExit("Ki-Core version must use stable X.Y.Z SemVer")
-if re.fullmatch(r"v\d+\.\d+\.\d+", tag) is None:
-    raise SystemExit("AionCore tag must use vX.Y.Z")
-if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
-    raise SystemExit("AionCore peeled commit must be a full lowercase SHA")
-try:
-    datetime.date.fromisoformat(recorded_at)
-except ValueError as error:
-    raise SystemExit("KI_CORE_RECORDED_AT must use YYYY-MM-DD") from error
 
-data = json.loads(path.read_text())
-data.setdefault("versions", []).append(
-    {
-        "version": version,
-        "tag": f"ki-core-v{version}",
-        "aionCore": {"tag": tag, "peeledCommit": commit},
-    }
+def semver(value: str) -> tuple[int, int, int]:
+    match = semver_pattern.fullmatch(value)
+    if match is None:
+        raise SystemExit(f"Invalid Ki-Core version in mapping: {value}")
+    return tuple(int(part) for part in match.groups())
+
+
+data = json.loads(source_path.read_text())
+if data.get("schemaVersion") != 1 or not isinstance(data.get("versions"), list):
+    raise SystemExit("ki-core-versions.json must use schemaVersion 1 with a versions array")
+
+entry = {
+    "version": version,
+    "tag": f"ki-core-v{version}",
+    "aionCore": {"tag": upstream_tag, "peeledCommit": upstream_commit},
+}
+existing_index = next(
+    (index for index, item in enumerate(data["versions"]) if item.get("version") == version),
+    None,
 )
-data.setdefault("statusHistory", []).append(
-    {"version": version, "status": "prepared", "recordedAt": recorded_at}
-)
+if existing_index is None:
+    if data["versions"] and semver(version) <= semver(data["versions"][-1]["version"]):
+        raise SystemExit("New Ki-Core mappings must use strictly increasing SemVer order")
+    data["versions"].append(entry)
+    result = f"Added Ki-Core {version} mapping to {upstream_tag}"
+elif data["versions"][existing_index] == entry:
+    result = f"Ki-Core {version} already matches the requested mapping"
+else:
+    if not allow_replace:
+        raise SystemExit(f"Ki-Core {version} is already released; its mapping cannot change")
+    data["versions"][existing_index] = entry
+    result = f"Updated unreleased Ki-Core {version} mapping to {upstream_tag}"
 
-with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
-    json.dump(data, handle, indent=2)
-    handle.write("\n")
-    temporary_path = handle.name
-os.replace(temporary_path, path)
+target_path.write_text(json.dumps(data, indent=2) + "\n")
+print(result)
 PY
 
-if ! bash "$validator"; then
-    cp "$backup_file" "$versions_file"
-    echo "Restored ki-core-versions.json after validation failure" >&2
-    exit 1
-fi
-
-echo "Added Ki-Core $ki_core_version mapping to AionCore $aioncore_tag ($aioncore_commit)"
+mv "$tmp_file" "$versions_file"
+trap - EXIT

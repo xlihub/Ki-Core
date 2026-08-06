@@ -9,10 +9,14 @@ The corresponding AionCore tag and peeled commit are recorded in
 [`ki-core-versions.json`](ki-core-versions.json). Runtime source and Cargo
 versions continue to follow the mapped AionCore release.
 
-## Release PR body contract
+## Release PR machine contract
 
 Release Please parses the merged release PR body before it creates the Ki-Core
-tag and GitHub Release. A release PR body must preserve this structure:
+tag and GitHub Release. It also requires a generated release branch name. For
+Ki-Core releases, use the legacy-compatible branch pattern
+`release-ki-core-vX.Y.Z`, for example `release-ki-core-v0.1.0`.
+
+A release PR body must preserve this structure:
 
 ```markdown
 Ki-Core X.Y.Z release
@@ -28,5 +32,6 @@ Release Please footer or maintainer notes
 
 The header, release notes, and footer may be written in Chinese. Do not replace
 the two `---` delimiters or the `## [X.Y.Z]` version heading with an unstructured
-PR description. Ordinary feature, fix, and maintenance PRs are not subject to
-this machine-readable body contract.
+PR description. Do not rename a release branch to an ordinary feature or fix
+branch. Ordinary feature, fix, and maintenance PRs are not subject to this
+machine-readable contract.

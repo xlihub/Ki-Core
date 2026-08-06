@@ -1,31 +1,24 @@
 name: Ki-Core Stable Release
 
 on:
+  push:
+    tags:
+      - "ki-core-v*"
+  workflow_call:
+    inputs:
+      tag_name:
+        description: Ki-Core tag to build and publish, for example ki-core-v0.1.0
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag_name:
-        description: Ki-Core stable tag, for example ki-core-v0.1.0
+        description: Ki-Core tag to build and publish, for example ki-core-v0.1.0
         required: true
         type: string
-      release_commit:
-        description: Full verified product/main commit SHA
-        required: true
-        type: string
-      candidate_run_id:
-        description: Successful all-platform candidate workflow run ID
-        required: true
-        type: string
-      confirm_publish:
-        description: Request protected draft creation and publication
-        required: true
-        type: boolean
-        default: false
 
-permissions: read-all
-
-concurrency:
-  group: ki-core-stable-release
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,155 +27,70 @@ env:
   CROSS_GIT_REV: "29d00c7803f221f1b3f35e561b03792368fb8339"
   LINUX_X64_GLIBC_MAX: "GLIBC_2.34"
   LINUX_ARM64_GLIBC_MAX: "GLIBC_2.30"
+  RELEASE_TAG: ${{ inputs.tag_name || github.ref_name }}
 
 jobs:
-  prepare:
-    name: Validate Stable Release Request
-    if: vars.KI_ENABLE_RELEASE_AUTOMATION == 'true' && github.ref == 'refs/heads/product/main' && inputs.confirm_publish
+  prepare-release:
+    name: Prepare Release Metadata
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
     outputs:
-      version: ${{ steps.release.outputs.version }}
-      tag: ${{ steps.release.outputs.tag }}
-      commit: ${{ steps.release.outputs.commit }}
+      version: ${{ steps.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.release_commit }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - name: Validate tag, commit, mapping, and candidate run
-        id: release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag_name }}
-          RELEASE_COMMIT: ${{ inputs.release_commit }}
-          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      - name: Validate release tag and mapping
+        id: metadata
+        shell: bash
         run: |
           set -euo pipefail
-
           if [[ ! "$RELEASE_TAG" =~ ^ki-core-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "tag_name must use ki-core-vX.Y.Z" >&2
+            echo "Release tag must use ki-core-vX.Y.Z" >&2
             exit 1
           fi
-          if [[ ! "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "release_commit must be a full lowercase commit SHA" >&2
-            exit 1
-          fi
-          if [[ ! "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "candidate_run_id must be numeric" >&2
-            exit 1
-          fi
-
           version="${RELEASE_TAG#ki-core-v}"
           if [[ "$(tr -d '[:space:]' < ki-core-version.txt)" != "$version" ]]; then
-            echo "tag_name does not match ki-core-version.txt" >&2
+            echo "Release tag does not match ki-core-version.txt" >&2
             exit 1
           fi
-          if [[ "$(git rev-parse HEAD)" != "$RELEASE_COMMIT" ]]; then
-            echo "Checked-out commit does not match release_commit" >&2
-            exit 1
-          fi
-          git fetch --no-tags origin product/main
-          if [[ "$(git rev-parse FETCH_HEAD)" != "$RELEASE_COMMIT" ]]; then
-            echo "release_commit is not the current product/main head" >&2
-            exit 1
-          fi
-          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
-            $2 == "refs/tags/" tag "^{}" { peeled = $1 }
-            $2 == "refs/tags/" tag { direct = $1 }
-            END { print (peeled != "" ? peeled : direct) }
-          ')"
-          if [[ -n "$remote_tag" && "$remote_tag" != "$RELEASE_COMMIT" ]]; then
-            echo "Existing release tag points to an unexpected commit" >&2
-            exit 1
-          fi
-
           KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/validate-release-metadata.sh
-
-          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build-manual.yml" > candidate-workflow.json
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" > candidate-run.json
-          jq -e \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg release_commit "$RELEASE_COMMIT" \
-            --argjson workflow_id "$(jq -r '.id' candidate-workflow.json)" \
-            '.repository.full_name == $repository
-              and .workflow_id == $workflow_id
-              and .event == "workflow_dispatch"
-              and .status == "completed"
-              and .conclusion == "success"
-              and .head_branch == "product/main"
-              and .head_sha == $release_commit' \
-            candidate-run.json > /dev/null
-
-          expected_artifacts="$(printf '%s\n' \
-            ki-core-candidate-linux-arm64 \
-            ki-core-candidate-linux-x64 \
-            ki-core-candidate-macos-arm64 \
-            ki-core-candidate-macos-x64 \
-            ki-core-candidate-windows-arm64 \
-            ki-core-candidate-windows-x64)"
-          actual_artifacts="$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}/artifacts" \
-            --jq '.artifacts[] | select(.expired == false) | .name' | sort)"
-          if [[ "$actual_artifacts" != "$expected_artifacts" ]]; then
-            echo "Candidate run does not contain the exact six canonical artifacts" >&2
-            diff -u <(printf '%s\n' "$expected_artifacts") <(printf '%s\n' "$actual_artifacts") || true
-            exit 1
-          fi
-
-          rm candidate-workflow.json candidate-run.json
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Stable ${{ matrix.platform }}
-    needs: prepare
+    name: Build ${{ matrix.target }}
+    needs: prepare-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-            binary_name: aioncore
-          - platform: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            binary_name: aioncore
-          - platform: linux-x64
-            os: ubuntu-22.04
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary_name: aioncore
-          - platform: linux-arm64
-            os: ubuntu-latest
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             binary_name: aioncore
             use_cross: true
-          - platform: windows-x64
-            os: windows-latest
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: aioncore
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: aioncore
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: aioncore.exe
             rustflags: "-C target-feature=+crt-static"
-          - platform: windows-arm64
-            os: windows-latest
+          - os: windows-latest
             target: aarch64-pc-windows-msvc
             binary_name: aioncore.exe
             rustflags: "-C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.prepare.outputs.commit }}
-
-      - name: Verify checked-out release commit
-        shell: bash
-        env:
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -197,7 +105,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ki-core-stable-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
+          shared-key: ki-core-release-${{ matrix.target }}-${{ matrix.os }}${{ matrix.target == 'x86_64-unknown-linux-gnu' && format('-glibc-{0}', env.LINUX_X64_GLIBC_MAX) || '' }}${{ matrix.use_cross == true && format('-cross-{0}-glibc-{1}', env.CROSS_GIT_REV, env.LINUX_ARM64_GLIBC_MAX) || '' }}
 
       - name: Verify pinned Linux ARM64 cross image
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -229,318 +137,66 @@ jobs:
         shell: bash
         run: scripts/check-glibc-baseline.sh "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "${LINUX_X64_GLIBC_MAX}"
 
-      - name: Package stable archive
+      - name: Package binary
         if: runner.os != 'Windows'
         shell: bash
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           archive="ki-core-v${VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/$archive" "${{ matrix.binary_name }}"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${archive}" "${{ matrix.binary_name }}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
-      - name: Package stable archive
+      - name: Package binary
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
           $archive = "ki-core-v${env:VERSION}-${{ matrix.target }}.zip"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}" -Force
+          "ARCHIVE=${archive}" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload stable build artifact
+      - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ki-core-stable-${{ matrix.platform }}
-          path: dist/*
+          name: ${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE }}
           if-no-files-found: error
 
-  assemble:
-    name: Assemble and Verify Stable Assets
-    needs: [prepare, build]
+  github-release:
+    name: Upload GitHub Release Assets
+    needs: [prepare-release, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.commit }}
-
-      - name: Download six stable archives
-        uses: actions/download-artifact@v8
-        with:
-          pattern: ki-core-stable-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Build and verify stable manifest
-        env:
-          KI_CORE_REPOSITORY: ${{ github.repository }}
-          KI_CORE_WORKFLOW: release.yml
-          KI_CORE_RUN_ID: ${{ github.run_id }}
-          KI_CORE_HEAD_SHA: ${{ needs.prepare.outputs.commit }}
-          KI_CORE_RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-          KI_CORE_TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          scripts/ki-core-release/build-release-manifest.sh stable release-assets
-          scripts/ki-core-release/verify-release-assets.sh stable release-assets
-
-      - name: Upload verified stable asset set
-        uses: actions/upload-artifact@v7
-        with:
-          name: ki-core-stable-assets-${{ github.run_id }}
-          path: release-assets/*
-          if-no-files-found: error
-
-  publish:
-    name: Publish Verified Stable Release
-    needs: [prepare, assemble]
-    runs-on: ubuntu-latest
-    environment: ki-core-stable
     permissions:
       contents: write
-      issues: write
-      pull-requests: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ needs.prepare.outputs.commit }}
-
-      - name: Download verified stable asset set
+      - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
-          name: ki-core-stable-assets-${{ github.run_id }}
-          path: release-assets
+          path: artifacts
+          merge-multiple: true
 
-      - name: Reverify assets before any GitHub mutation
-        run: scripts/ki-core-release/verify-release-assets.sh stable release-assets
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum ki-core-* > ki-core-checksums.txt
 
-      - name: Inspect existing draft
-        id: draft
+      - name: Upload release assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
-          jq \
-            --arg tag "$RELEASE_TAG" \
-            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
-            release-pages.json > draft-matches.json
-          draft_count="$(jq 'length' draft-matches.json)"
-          if [[ "$draft_count" == "1" ]]; then
-            jq -e \
-              --arg tag "$RELEASE_TAG" \
-              --arg commit "$RELEASE_COMMIT" \
-              '.[0] | .draft == true and .tag_name == $tag and .target_commitish == $commit' \
-              draft-matches.json > /dev/null
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$draft_count" == "0" ]]; then
-            if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
-              echo "Release tag already exists without a matching draft" >&2
-              exit 1
-            fi
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --repo "$REPOSITORY" --clobber
           else
-            echo "Multiple draft releases use tag $RELEASE_TAG" >&2
-            exit 1
-          fi
-
-          rm -f release-pages.json draft-matches.json
-
-      - name: Create draft with Release Please
-        if: steps.draft.outputs.exists == 'false'
-        id: release-please
-        uses: googleapis/release-please-action@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          target-branch: product/main
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          skip-github-pull-request: true
-
-      - name: Validate Release Please draft output
-        if: steps.draft.outputs.exists == 'false'
-        env:
-          CREATED: ${{ steps.release-please.outputs.release_created }}
-          CREATED_TAG: ${{ steps.release-please.outputs.tag_name }}
-          CREATED_SHA: ${{ steps.release-please.outputs.sha }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: |
-          if [[ "$CREATED" != "true" || "$CREATED_TAG" != "$RELEASE_TAG" || "$CREATED_SHA" != "$RELEASE_COMMIT" ]]; then
-            echo "Release Please created an unexpected draft identity" >&2
-            exit 1
-          fi
-
-      - name: Upload only missing assets and verify existing hashes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: |
-          set -euo pipefail
-
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
-          jq \
-            --arg tag "$RELEASE_TAG" \
-            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
-            release-pages.json > draft-matches.json
-          jq -e \
-            --arg tag "$RELEASE_TAG" \
-            --arg commit "$RELEASE_COMMIT" \
-            'length == 1 and .[0].draft == true and .[0].tag_name == $tag and .[0].target_commitish == $commit' \
-            draft-matches.json > /dev/null
-          jq '.[0]' draft-matches.json > draft-release.json
-
-          mapfile -t expected_assets < <(find release-assets -maxdepth 1 -type f -print | sort)
-          mapfile -t remote_assets < <(jq -r '.assets[].name' draft-release.json | sort)
-          if [[ "$(printf '%s\n' "${remote_assets[@]}" | sed '/^$/d' | wc -l | tr -d ' ')" != "$(printf '%s\n' "${remote_assets[@]}" | sed '/^$/d' | sort -u | wc -l | tr -d ' ')" ]]; then
-            echo "Draft contains duplicate asset names" >&2
-            exit 1
-          fi
-          declare -A expected_names=()
-          for asset_path in "${expected_assets[@]}"; do
-            expected_names["$(basename "$asset_path")"]="$asset_path"
-          done
-          for remote_name in "${remote_assets[@]}"; do
-            if [[ -z "${expected_names[$remote_name]:-}" ]]; then
-              echo "Draft contains unexpected asset: $remote_name" >&2
-              exit 1
-            fi
-          done
-
-          mkdir existing-assets
-          upload_args=()
-          for asset_path in "${expected_assets[@]}"; do
-            asset_name="$(basename "$asset_path")"
-            if printf '%s\n' "${remote_assets[@]}" | grep -Fxq "$asset_name"; then
-              asset_id="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .id' draft-release.json)"
-              gh api \
-                -H "Accept: application/octet-stream" \
-                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-                > "existing-assets/$asset_name"
-              if [[ "$(sha256sum "$asset_path" | awk '{print $1}')" != "$(sha256sum "existing-assets/$asset_name" | awk '{print $1}')" ]]; then
-                echo "Existing draft asset hash does not match: $asset_name" >&2
-                exit 1
-              fi
-            else
-              upload_args+=("$asset_path")
-            fi
-          done
-          if (( ${#upload_args[@]} > 0 )); then
-            upload_url="$(jq -r '.upload_url | split("{")[0]' draft-release.json)"
-            for asset_path in "${upload_args[@]}"; do
-              asset_name="$(basename "$asset_path")"
-              curl --fail-with-body --location --request POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "X-GitHub-Api-Version: 2026-03-10" \
-                -H "Content-Type: application/octet-stream" \
-                --data-binary "@$asset_path" \
-                --output /dev/null \
-                "${upload_url}?name=${asset_name}"
-            done
-          fi
-
-          rm -f release-pages.json draft-matches.json draft-release.json
-
-      - name: Download and verify the populated draft
-        id: verified_draft
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-        run: |
-          set -euo pipefail
-
-          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > release-pages.json
-          jq \
-            --arg tag "$RELEASE_TAG" \
-            '[.[][] | select(.draft == true and .tag_name == $tag)]' \
-            release-pages.json > draft-matches.json
-          jq -e \
-            --arg tag "$RELEASE_TAG" \
-            --arg commit "$RELEASE_COMMIT" \
-            'length == 1 and .[0].draft == true and .[0].tag_name == $tag and .[0].target_commitish == $commit' \
-            draft-matches.json > /dev/null
-          jq '.[0]' draft-matches.json > draft-release.json
-
-          mkdir verified-draft
-          while IFS=$'\t' read -r asset_id asset_name; do
-            if [[ ! "$asset_name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-              echo "Draft contains an unsafe asset name: $asset_name" >&2
-              exit 1
-            fi
-            gh api \
-              -H "Accept: application/octet-stream" \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              > "verified-draft/$asset_name"
-          done < <(jq -r '.assets[] | [.id, .name] | @tsv' draft-release.json)
-          scripts/ki-core-release/verify-release-assets.sh stable verified-draft
-
-          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
-            $2 == "refs/tags/" tag "^{}" { peeled = $1 }
-            $2 == "refs/tags/" tag { direct = $1 }
-            END { print (peeled != "" ? peeled : direct) }
-          ')"
-          if [[ -n "$remote_tag" && "$remote_tag" != "$RELEASE_COMMIT" ]]; then
-            echo "Existing release tag points to an unexpected commit" >&2
-            exit 1
-          fi
-          if [[ -z "$remote_tag" ]]; then
-            if ! gh api --method POST \
-              "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${RELEASE_TAG}" \
-              -f sha="$RELEASE_COMMIT" > created-tag.json; then
-              concurrent_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
-                $2 == "refs/tags/" tag "^{}" { peeled = $1 }
-                $2 == "refs/tags/" tag { direct = $1 }
-                END { print (peeled != "" ? peeled : direct) }
-              ')"
-              if [[ "$concurrent_tag" != "$RELEASE_COMMIT" ]]; then
-                echo "Failed to create the verified release tag" >&2
-                exit 1
-              fi
-            fi
-          fi
-
-          echo "release_id=$(jq -r '.id' draft-release.json)" >> "$GITHUB_OUTPUT"
-          rm -f release-pages.json draft-matches.json draft-release.json created-tag.json
-
-      - name: Publish verified draft
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
-          RELEASE_ID: ${{ steps.verified_draft.outputs.release_id }}
-        run: |
-          set -euo pipefail
-
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            -F draft=false > published-release.json
-          jq -e \
-            --arg tag "$RELEASE_TAG" \
-            --arg commit "$RELEASE_COMMIT" \
-            '.draft == false and .tag_name == $tag and .target_commitish == $commit' \
-            published-release.json > /dev/null
-
-          published_tag=""
-          for _attempt in 1 2 3 4 5; do
-            published_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}" | awk -v tag="$RELEASE_TAG" '
-              $2 == "refs/tags/" tag "^{}" { peeled = $1 }
-              $2 == "refs/tags/" tag { direct = $1 }
-              END { print (peeled != "" ? peeled : direct) }
-            ')"
-            [[ -n "$published_tag" ]] && break
-            sleep 2
-          done
-          if [[ "$published_tag" != "$RELEASE_COMMIT" ]]; then
-            echo "Published release tag does not point to the verified commit" >&2
-            exit 1
+            gh release create "$RELEASE_TAG" artifacts/* \
+              --repo "$REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
           fi

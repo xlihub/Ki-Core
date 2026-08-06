@@ -183,17 +183,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -DestinationPath "dist/${archive}"
 
-      - name: Build and verify candidate provenance
-        shell: bash
-        env:
-          KI_CORE_REPOSITORY: ${{ github.repository }}
-          KI_CORE_WORKFLOW: build-manual.yml
-          KI_CORE_RUN_ID: ${{ github.run_id }}
-          KI_CORE_HEAD_SHA: ${{ github.sha }}
-        run: |
-          scripts/ki-core-release/build-release-manifest.sh candidate dist
-          scripts/ki-core-release/verify-release-assets.sh candidate dist
-
       - name: Upload candidate artifact
         uses: actions/upload-artifact@v7
         with:

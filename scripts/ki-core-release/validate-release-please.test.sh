@@ -65,6 +65,8 @@ required_patterns=(
     "fromJSON(steps.release-please.outputs.pr).headBranchName"
     "scripts/ki-core-release/update-release-map.sh"
     "scripts/ki-core-release/validate-release-metadata.sh"
+    "mv ki-core-upstream-pending.json ki-core-upstream.json"
+    "git add -A ki-core-upstream.json ki-core-upstream-pending.json ki-core-versions.json"
     "--field force_workspace_test=false"
 )
 for pattern in "${required_patterns[@]}"; do

@@ -94,9 +94,12 @@ jobs:
           ref: ${{ fromJSON(steps.release-please.outputs.pr).headBranchName }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update Ki-Core version mapping
+      - name: Update Ki-Core release metadata
         if: steps.release-please.outputs.pr
         run: |
+          if [[ -f ki-core-upstream-pending.json ]]; then
+            mv ki-core-upstream-pending.json ki-core-upstream.json
+          fi
           version="$(tr -d '[:space:]' < ki-core-version.txt)"
           upstream_tag="$(jq -er '.tag' ki-core-upstream.json)"
           upstream_commit="$(jq -er '.peeledCommit' ki-core-upstream.json)"
@@ -106,16 +109,16 @@ jobs:
             "$upstream_commit"
           KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/validate-release-metadata.sh
 
-      - name: Commit version mapping if changed
+      - name: Commit release metadata if changed
         if: steps.release-please.outputs.pr
         run: |
-          if git diff --quiet -- ki-core-versions.json; then
-            echo "Ki-Core version mapping is already current"
+          if git diff --quiet -- ki-core-upstream.json ki-core-upstream-pending.json ki-core-versions.json; then
+            echo "Ki-Core release metadata is already current"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add ki-core-versions.json
-            git commit -m "chore(release): update Ki-Core version mapping"
+            git add -A ki-core-upstream.json ki-core-upstream-pending.json ki-core-versions.json
+            git commit -m "chore(release): update Ki-Core release metadata"
             git push
           fi
 

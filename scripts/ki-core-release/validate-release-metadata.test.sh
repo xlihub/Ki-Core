@@ -54,7 +54,13 @@ init_case_repo() {
         git add .
         git commit -q -m "seed upstream"
         git tag v0.1.59
+
+        printf '%s\n' 'pub fn next_upstream() {}' > crates/demo/src/lib.rs
+        git add crates/demo/src/lib.rs
+        git commit -q -m "update upstream"
         git tag v0.1.60
+
+        git checkout -q -b product v0.1.59
     )
 
     local upstream_commit
@@ -102,6 +108,7 @@ run_expect "$valid_repo" 0 "Ki-Core release metadata validation passed" \
 
 update_repo="$(init_case_repo update-current)"
 update_commit="$(git -C "$update_repo" rev-parse 'v0.1.60^{commit}')"
+git -C "$update_repo" show 'v0.1.60:crates/demo/src/lib.rs' > "$update_repo/crates/demo/src/lib.rs"
 python3 - "$update_repo/ki-core-upstream.json" "$update_commit" <<'PY'
 import json
 import pathlib
@@ -116,6 +123,38 @@ PY
 run_expect "$update_repo" 0 "Updated unreleased Ki-Core 0.1.0 mapping to v0.1.60" \
     bash scripts/ki-core-release/update-release-map.sh 0.1.0 v0.1.60 "$update_commit"
 run_expect "$update_repo" 0 "Ki-Core release metadata validation passed" \
+    bash scripts/ki-core-release/validate-release-metadata.sh
+
+pending_repo="$(init_case_repo pending-upstream)"
+pending_commit="$(git -C "$pending_repo" rev-parse 'v0.1.60^{commit}')"
+git -C "$pending_repo" show 'v0.1.60:crates/demo/src/lib.rs' > "$pending_repo/crates/demo/src/lib.rs"
+cat > "$pending_repo/ki-core-upstream-pending.json" <<EOF
+{
+  "schemaVersion": 1,
+  "repository": "iOfficeAI/AionCore",
+  "tag": "v0.1.60",
+  "peeledCommit": "$pending_commit"
+}
+EOF
+run_expect "$pending_repo" 0 "Ki-Core release metadata validation passed" \
+    bash scripts/ki-core-release/validate-release-metadata.sh
+printf '%s\n' '0.1.1' > "$pending_repo/ki-core-version.txt"
+mv "$pending_repo/ki-core-upstream-pending.json" "$pending_repo/ki-core-upstream.json"
+run_expect "$pending_repo" 0 "Added Ki-Core 0.1.1 mapping to v0.1.60" \
+    bash scripts/ki-core-release/update-release-map.sh 0.1.1 v0.1.60 "$pending_commit"
+run_expect "$pending_repo" 0 "Ki-Core release metadata validation passed" \
+    bash scripts/ki-core-release/validate-release-metadata.sh
+
+invalid_pending_repo="$(init_case_repo invalid-pending-upstream)"
+cat > "$invalid_pending_repo/ki-core-upstream-pending.json" <<'EOF'
+{
+  "schemaVersion": 1,
+  "repository": "iOfficeAI/AionCore",
+  "tag": "v0.1.60",
+  "peeledCommit": "0000000000000000000000000000000000000000"
+}
+EOF
+run_expect "$invalid_pending_repo" 1 "does not match peeledCommit" \
     bash scripts/ki-core-release/validate-release-metadata.sh
 
 next_repo="$(init_case_repo next-version)"

@@ -5,9 +5,13 @@ tracks a selected stable AionCore tag while keeping Ki-Core product versions,
 tags, release notes, and binary archives separate from AionCore.
 
 The current product version is stored in [`ki-core-version.txt`](ki-core-version.txt).
-The corresponding AionCore tag and peeled commit are recorded in
-[`ki-core-versions.json`](ki-core-versions.json). Runtime source and Cargo
-versions continue to follow the mapped AionCore release.
+The published AionCore baseline is stored in
+[`ki-core-upstream.json`](ki-core-upstream.json), and its release history is
+recorded in [`ki-core-versions.json`](ki-core-versions.json). A sync PR records
+its selected baseline in `ki-core-upstream-pending.json`; the Release Please PR
+promotes that file to the published baseline and updates the version history.
+Runtime source and Cargo versions continue to follow the selected AionCore
+release.
 
 ## Release PR machine contract
 

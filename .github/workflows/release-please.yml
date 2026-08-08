@@ -117,7 +117,7 @@ jobs:
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A ki-core-upstream.json ki-core-upstream-pending.json ki-core-versions.json
+            scripts/ki-core-release/stage-release-metadata.sh
             git commit -m "chore(release): update Ki-Core release metadata"
             git push
           fi

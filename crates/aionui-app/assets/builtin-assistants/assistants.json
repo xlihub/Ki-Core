@@ -167,6 +167,56 @@
       "models": []
     },
     {
+      "id": "agents-executor",
+      "sort_order": 40,
+      "default_enabled": true,
+      "name": "Agents Execution Assistant",
+      "name_i18n": {
+        "en-US": "Agents Execution Assistant",
+        "zh-CN": "Agents 执行助手",
+        "ru-RU": "Помощник выполнения Agents",
+        "uk-UA": "Помічник виконання Agents"
+      },
+      "description": "Find and run one published Agent for a standalone request.",
+      "description_i18n": {
+        "en-US": "Find and run one published Agent for a standalone request.",
+        "zh-CN": "为独立请求查找并执行一个已发布的 Agent。",
+        "ru-RU": "Находит и запускает один опубликованный Agent для отдельного запроса.",
+        "uk-UA": "Знаходить і запускає один опублікований Agent для окремого запиту."
+      },
+      "avatar": "avatars/agents-executor.jpg",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "ki-buddy-agents-execution"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "rule_file": "rules/agents-executor.{locale}.md",
+      "prompts": [
+        "Show me which published Agents can handle my request",
+        "Find the best published Agent for this task and run it"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Show me which published Agents can handle my request",
+          "Find the best published Agent for this task and run it"
+        ],
+        "zh-CN": [
+          "看看有哪些已发布的 Agent 可以处理我的请求",
+          "为这个任务选择合适的已发布 Agent 并执行"
+        ],
+        "ru-RU": [
+          "Покажи, какие опубликованные Agents могут выполнить мой запрос",
+          "Найди подходящий опубликованный Agent для этой задачи и запусти его"
+        ],
+        "uk-UA": [
+          "Покажи, які опубліковані Agents можуть виконати мій запит",
+          "Знайди відповідний опублікований Agent для цього завдання та запусти його"
+        ]
+      },
+      "models": []
+    },
+    {
       "id": "morph-ppt",
       "sort_order": 90,
       "default_enabled": false,

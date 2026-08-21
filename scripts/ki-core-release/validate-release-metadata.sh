@@ -154,7 +154,10 @@ disallowed_files=""
 while IFS= read -r path; do
     [[ -z "$path" ]] && continue
     case "$path" in
-        .github/workflows/* | \
+        crates/aionui-app/assets/builtin-assistants/* | \
+            crates/aionui-app/assets/builtin-skills/* | \
+            crates/aionui-app/tests/assistants_e2e.rs | \
+            .github/workflows/* | \
             .release-please-manifest.json | \
             release-please-config.json | \
             CHANGELOG.ki-core.md | \

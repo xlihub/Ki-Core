@@ -141,6 +141,16 @@ fn assert_versioned_avatar_value(value: Option<&str>, expected_path: &str) {
     );
 }
 
+#[test]
+fn embedded_registry_includes_default_enabled_agents_execution_assistant() {
+    let registry = BuiltinAssistantRegistry::load_embedded();
+    let assistant = registry
+        .get("agents-executor")
+        .expect("Agents execution assistant should be part of the official embedded registry");
+
+    assert!(assistant.default_enabled);
+}
+
 /// Build the whole app with:
 /// - a manifest at `{builtin_tmp}/assets/assistants.json` registering two
 ///   built-ins (`builtin-office` with rule/skill/avatar files on disk, and

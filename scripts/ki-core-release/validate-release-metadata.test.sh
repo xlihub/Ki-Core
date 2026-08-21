@@ -106,6 +106,22 @@ valid_repo="$(init_case_repo valid)"
 run_expect "$valid_repo" 0 "Ki-Core release metadata validation passed" \
     bash scripts/ki-core-release/validate-release-metadata.sh
 
+allowed_overlay_repo="$(init_case_repo allowed-product-overlay)"
+mkdir -p \
+    "$allowed_overlay_repo/crates/aionui-app/assets/builtin-assistants/rules" \
+    "$allowed_overlay_repo/crates/aionui-app/assets/builtin-skills/product-assistant" \
+    "$allowed_overlay_repo/crates/aionui-app/tests"
+printf '%s\n' '{"version":"1.0.0","assistants":[]}' \
+    > "$allowed_overlay_repo/crates/aionui-app/assets/builtin-assistants/assistants.json"
+printf '%s\n' '# Product assistant rule' \
+    > "$allowed_overlay_repo/crates/aionui-app/assets/builtin-assistants/rules/product-assistant.en-US.md"
+printf '%s\n' '# Product assistant skill' \
+    > "$allowed_overlay_repo/crates/aionui-app/assets/builtin-skills/product-assistant/SKILL.md"
+printf '%s\n' '#[test] fn product_assistant_is_available() {}' \
+    > "$allowed_overlay_repo/crates/aionui-app/tests/assistants_e2e.rs"
+run_expect "$allowed_overlay_repo" 0 "Ki-Core release metadata validation passed" \
+    bash scripts/ki-core-release/validate-release-metadata.sh
+
 update_repo="$(init_case_repo update-current)"
 update_commit="$(git -C "$update_repo" rev-parse 'v0.1.60^{commit}')"
 git -C "$update_repo" show 'v0.1.60:crates/demo/src/lib.rs' > "$update_repo/crates/demo/src/lib.rs"

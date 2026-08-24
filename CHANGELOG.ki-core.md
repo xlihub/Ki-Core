@@ -4,6 +4,14 @@ This changelog records Ki-Core product releases. Runtime changes inherited from
 AionCore remain in [CHANGELOG.md](CHANGELOG.md) and are linked through the
 version mapping in [ki-core-versions.json](ki-core-versions.json).
 
+## [0.1.2](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.1...ki-core-v0.1.2) (2026-08-24)
+
+
+### Features
+
+* **agents:** require file upload before invoke ([ff55cde](https://github.com/xlihub/Ki-Core/commit/ff55cdeb104597b713e47e44e7734fbfa968d814))
+* **agents:** require file upload before invoke ([#23](https://github.com/xlihub/Ki-Core/issues/23)) ([3925042](https://github.com/xlihub/Ki-Core/commit/3925042192702b8b30ce982e638636981f4a1406))
+
 ## [0.1.1](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.0...ki-core-v0.1.1) (2026-08-21)
 
 

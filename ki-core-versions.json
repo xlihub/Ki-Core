@@ -16,6 +16,14 @@
         "tag": "v0.1.59",
         "peeledCommit": "815e61ed9bbe942339347dc1e69ddce176cded76"
       }
+    },
+    {
+      "version": "0.1.2",
+      "tag": "ki-core-v0.1.2",
+      "aionCore": {
+        "tag": "v0.1.59",
+        "peeledCommit": "815e61ed9bbe942339347dc1e69ddce176cded76"
+      }
     }
   ]
 }

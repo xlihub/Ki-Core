@@ -5,9 +5,9 @@
 mod agent_env;
 mod cache;
 mod http_client;
-pub mod managed_cli;
 pub mod managed_resources;
 pub mod managed_resources_contract;
+pub use managed_resources_contract::current_runtime_key;
 pub mod node_runtime;
 mod registry_npx_lock;
 mod resolver;
@@ -15,7 +15,6 @@ mod shell_env;
 
 pub use agent_env::agent_process_env;
 pub use cache::init;
-pub use managed_cli::{CLAUDE_CLI_VERSION, CODEX_CLI_VERSION, cli_version, resolve_bundled_cli};
 pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
@@ -26,7 +25,7 @@ pub use node_runtime::{
 };
 pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
 pub use resolver::{resolve_command_in, resolve_command_path};
-pub use shell_env::enhance_process_path;
+pub use shell_env::{ShellProbeReport, ShellProbeStatus, enhance_process_path, login_shell_probe_report};
 mod spawn;
 pub use spawn::{Builder, kill_process_tree};
 

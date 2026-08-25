@@ -389,6 +389,81 @@ fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Recursively copy a directory tree from `src` to `dest`. `dest` must not yet
+/// exist (the caller picks a conflict-free name); the whole subtree is recreated
+/// underneath it, so no inner-file collision handling is needed.
+fn copy_dir_recursive_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
+    std::fs::create_dir_all(dest)
+        .map_err(|e| FileError::Internal(format!("cannot create directory '{}': {e}", dest.display())))?;
+
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| FileError::Internal(format!("cannot read directory '{}': {e}", src.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| FileError::Internal(format!("cannot read directory entry: {e}")))?;
+        let child_src = entry.path();
+        let child_dest = dest.join(entry.file_name());
+        // `file_type()` does not follow symlinks; a symlinked subdir is copied as
+        // a plain file via `std::fs::copy` rather than being followed (avoids
+        // cycles and escaping the source tree).
+        let file_type = entry
+            .file_type()
+            .map_err(|e| FileError::Internal(format!("cannot stat '{}': {e}", child_src.display())))?;
+        if file_type.is_dir() {
+            copy_dir_recursive_sync(&child_src, &child_dest)?;
+        } else {
+            std::fs::copy(&child_src, &child_dest).map_err(|e| {
+                FileError::Internal(format!(
+                    "cannot copy '{}' to '{}': {e}",
+                    child_src.display(),
+                    child_dest.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Split a filename into `(stem, extension-including-dot)` at the last interior
+/// dot. A leading dot (dotfile) is not an extension separator, so `.gitignore`
+/// → `(".gitignore", "")`. Mirrors the monitor WS transfer path.
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+/// The conflict-free candidate name for the `attempt`-th try (0 = the original).
+/// Files keep their extension (`report.txt` → `report copy.txt`); directories and
+/// dotfiles take the suffix wholesale. Mirrors the monitor WS transfer path
+/// (`aionui-project::monitor::dispatch`) so OS-external drops and in-app copies
+/// produce identical collision-avoidance names.
+fn candidate_name(base: &str, attempt: usize, is_dir: bool) -> String {
+    if attempt == 0 {
+        return base.to_owned();
+    }
+    let (stem, ext) = if is_dir { (base, "") } else { split_ext(base) };
+    if attempt == 1 {
+        format!("{stem} copy{ext}")
+    } else {
+        format!("{stem} copy {attempt}{ext}")
+    }
+}
+
+/// Pick the first non-colliding destination path under `parent_dir` for `base`
+/// (`name` → `name copy` → `name copy 2` …), never overwriting. Returns `None`
+/// if every candidate up to the cap is taken.
+fn free_dest_path(parent_dir: &Path, base: &str, is_dir: bool) -> Option<std::path::PathBuf> {
+    const MAX_ATTEMPTS: usize = 10_000;
+    for attempt in 0..MAX_ATTEMPTS {
+        let candidate = parent_dir.join(candidate_name(base, attempt, is_dir));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Read a local image file and return a base64 Data URL.
 fn get_image_base64_sync(path: &Path) -> Result<String, FileError> {
     let bytes =
@@ -407,20 +482,50 @@ fn get_image_base64_sync(path: &Path) -> Result<String, FileError> {
 /// Encode a file's content for the `/api/fs/content` endpoint per `encoding`.
 /// `Utf8` → text (errors on non-UTF-8); `Base64` → raw bytes base64 (no prefix);
 /// `DataUrl` → `data:<mime>;base64,<...>`. The 256 MB read cap applies to all.
+///
+/// Reached only from `read_resolved_content`, whose path was resolved from a
+/// `ChatFileRef` — server-side knowledge the client never saw. Errors here are
+/// therefore path-free (`TargetNotFound` / a fixed `Internal` message) with the
+/// detail going to the log instead, unlike the sibling helpers that serve
+/// client-supplied paths and may echo them back.
 fn read_resolved_content_sync(path: &Path, encoding: ContentEncoding) -> Result<String, FileError> {
     match encoding {
-        ContentEncoding::Utf8 => {
-            read_file_sync(path)?.ok_or_else(|| FileError::NotFound(format!("file not found: {}", path.display())))
-        }
+        ContentEncoding::Utf8 => read_file_sync(path)
+            .map_err(|err| resolved_read_error(path, err))?
+            .ok_or(FileError::TargetNotFound),
         ContentEncoding::Base64 => {
-            if validate_file_for_read(path)?.is_none() {
-                return Err(FileError::NotFound(format!("file not found: {}", path.display())));
+            if validate_file_for_read(path)
+                .map_err(|err| resolved_read_error(path, err))?
+                .is_none()
+            {
+                return Err(FileError::TargetNotFound);
             }
-            let bytes = std::fs::read(path)
-                .map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
+            let bytes = std::fs::read(path).map_err(|e| {
+                tracing::error!(target: "chat_file", path = %path.display(), error = %e, "cannot read resolved file");
+                FileError::Internal("cannot read file".to_owned())
+            })?;
             Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
         }
-        ContentEncoding::DataUrl => get_image_base64_sync(path),
+        ContentEncoding::DataUrl => get_image_base64_sync(path).map_err(|err| resolved_read_error(path, err)),
+    }
+}
+
+/// Strip path detail from an error raised while reading an identity-addressed
+/// file, logging it instead. Helpers shared with the client-supplied-path routes
+/// embed the path in their messages, which must not reach these callers.
+fn resolved_read_error(path: &Path, err: FileError) -> FileError {
+    match err {
+        FileError::NotFound(cause) => {
+            tracing::warn!(target: "chat_file", path = %path.display(), error = %cause, "resolved read target unavailable");
+            FileError::TargetNotFound
+        }
+        FileError::Internal(cause) => {
+            tracing::error!(target: "chat_file", path = %path.display(), error = %cause, "resolved read failed");
+            FileError::Internal("cannot read file".to_owned())
+        }
+        // BadRequest / PathOutsideSandbox carry validation context, not a resolved
+        // path, and their messages are already client-safe.
+        other => other,
     }
 }
 
@@ -485,9 +590,20 @@ impl crate::traits::IFileService for FileService {
     async fn write_resolved_content(&self, absolute_path: &Path, data: &[u8]) -> Result<(), FileError> {
         let path = absolute_path.to_path_buf();
         let data = data.to_vec();
+        let log_path = absolute_path.to_path_buf();
         tokio::task::spawn_blocking(move || write_file_sync(&path, &data))
             .await
-            .map_err(|e| FileError::Internal(format!("write content task failed: {e}")))??;
+            .map_err(|e| FileError::Internal(format!("write content task failed: {e}")))?
+            // Same reasoning as `resolved_metadata`: `write_file_sync` embeds the
+            // path in its message for the client-supplied-path callers, but this
+            // path was resolved from a `ChatFileRef`.
+            .map_err(|err| match err {
+                FileError::Internal(cause) => {
+                    tracing::error!(target: "chat_file", path = %log_path.display(), error = %cause, "resolved write failed");
+                    FileError::Internal("cannot write file".to_owned())
+                }
+                other => other,
+            })?;
         Ok(())
     }
 
@@ -496,6 +612,19 @@ impl crate::traits::IFileService for FileService {
         tokio::task::spawn_blocking(move || get_file_metadata_sync(&path))
             .await
             .map_err(|e| FileError::Internal(format!("metadata task failed: {e}")))?
+            // The caller resolved this path from a `ChatFileRef`, so it is
+            // server-side knowledge the client never saw. `get_file_metadata_sync`
+            // embeds the path in its `NotFound` message — fine for the
+            // client-supplied-path caller (`get_file_metadata`), which is only
+            // echoing back what the request contained, but a disclosure here. Swap
+            // in the payload-free variant; the path stays in the log.
+            .map_err(|err| match err {
+                FileError::NotFound(cause) => {
+                    tracing::warn!(target: "chat_file", error = %cause, "resolved metadata target is unreadable");
+                    FileError::TargetNotFound
+                }
+                other => other,
+            })
     }
 
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError> {
@@ -674,11 +803,11 @@ impl crate::traits::IFileService for FileService {
 
             for fp in &file_paths_owned {
                 let source_extra = source_root_owned.as_deref().or_else(|| Path::new(fp).parent());
-                let src = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
-                    Ok(p) if p.is_file() => p,
+                let (src, is_dir) = match validate_path_with_extra_root(fp, &roots_refs, source_extra) {
+                    Ok(p) if p.is_dir() => (p, true),
+                    Ok(p) if p.is_file() => (p, false),
                     Ok(_) => {
-                        // Directories are not copied this round (files-only).
-                        fail(fp, "not a file (directories are not supported yet)");
+                        fail(fp, "source is neither a file nor a directory");
                         continue;
                     }
                     Err(_) => {
@@ -687,6 +816,8 @@ impl crate::traits::IFileService for FileService {
                     }
                 };
 
+                // Relative path under the workspace: with a source_root the source
+                // subtree is preserved; otherwise the item lands at its basename.
                 let relative = match &sr_canonical {
                     Some(sr) => src
                         .strip_prefix(sr)
@@ -695,13 +826,37 @@ impl crate::traits::IFileService for FileService {
                     None => Path::new(src.file_name().unwrap_or_default()).to_path_buf(),
                 };
 
-                let dest = ws_canonical.join(&relative);
-                // Never silently overwrite: a name collision is a reported failure.
-                if dest.exists() {
-                    fail(fp, "a file with the same name already exists at the destination");
+                // Auto-rename on collision (never overwrite): the last path segment
+                // is the name we vary; everything above it is the preserved parent.
+                let base = match relative.file_name().and_then(|n| n.to_str()) {
+                    Some(name) if !name.is_empty() => name.to_owned(),
+                    _ => {
+                        fail(fp, "source has no valid file name");
+                        continue;
+                    }
+                };
+                let parent_dir = match relative.parent() {
+                    Some(p) => ws_canonical.join(p),
+                    None => ws_canonical.clone(),
+                };
+                if let Err(e) = std::fs::create_dir_all(&parent_dir) {
+                    fail(fp, &format!("cannot create destination directory: {e}"));
                     continue;
                 }
-                match copy_single_file_sync(&src, &dest) {
+                let dest = match free_dest_path(&parent_dir, &base, is_dir) {
+                    Some(d) => d,
+                    None => {
+                        fail(fp, "too many name collisions at the destination");
+                        continue;
+                    }
+                };
+
+                let outcome = if is_dir {
+                    copy_dir_recursive_sync(&src, &dest)
+                } else {
+                    copy_single_file_sync(&src, &dest)
+                };
+                match outcome {
                     Ok(()) => copied.push(fp.clone()),
                     Err(_) => fail(fp, "copy failed"),
                 }
@@ -899,6 +1054,9 @@ impl crate::traits::IFileService for FileService {
 mod tests {
     use super::*;
     use std::fs;
+
+    // The `resolved_*` methods under test are trait methods, not inherent ones.
+    use crate::traits::IFileService;
 
     #[test]
     fn build_dir_tree_sync_lists_files_and_dirs() {
@@ -1115,6 +1273,96 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -- identity-addressed reads must not disclose the resolved path -----------
+    //
+    // `read_resolved_content` / `resolved_metadata` / `write_resolved_content` are
+    // reached only from the `ChatFileRef` endpoints, where the absolute path is
+    // resolved server-side and the client has never seen it. The sync helpers they
+    // build on embed the path in their messages — correct for the callers that were
+    // handed a path by the client, a disclosure for these. The seals below strip it.
+
+    /// The helper deliberately keeps the path (its other caller echoes back a
+    /// client-supplied path), so the strip has to happen on the way out. Pinning it
+    /// here documents *why* the wrappers cannot simply forward the error.
+    #[test]
+    fn get_file_metadata_sync_keeps_path_for_client_supplied_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("secret-name.txt");
+        let err = get_file_metadata_sync(&fake).expect_err("must fail");
+        assert!(
+            err.to_string().contains("secret-name.txt"),
+            "helper is expected to name the path; the identity-addressed wrapper strips it"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_metadata_error_is_path_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("secret-name.docx");
+        let svc = test_service(dir.path());
+
+        let err = svc.resolved_metadata(&missing).await.expect_err("must fail");
+        assert!(
+            matches!(err, FileError::TargetNotFound),
+            "expected TargetNotFound, got {err:?}"
+        );
+        assert_path_absent(&err, "secret-name");
+    }
+
+    #[tokio::test]
+    async fn read_resolved_content_error_is_path_free_for_every_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("secret-name.docx");
+        let svc = test_service(dir.path());
+
+        // All three encodings take different branches through the helper; each has to
+        // be sealed, and DataUrl in particular routes via `get_image_base64_sync`.
+        for encoding in [ContentEncoding::Utf8, ContentEncoding::Base64, ContentEncoding::DataUrl] {
+            let err = svc
+                .read_resolved_content(&missing, encoding)
+                .await
+                .expect_err("must fail");
+            assert_path_absent(&err, "secret-name");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_resolved_content_error_is_path_free() {
+        let dir = tempfile::tempdir().unwrap();
+        // A path whose parent does not exist → write fails inside the helper.
+        let unwritable = dir.path().join("secret-name-dir/nested/file.txt");
+        let svc = test_service(dir.path());
+
+        let err = svc
+            .write_resolved_content(&unwritable, b"x")
+            .await
+            .expect_err("must fail");
+        assert_path_absent(&err, "secret-name-dir");
+    }
+
+    fn test_service(root: &Path) -> FileService {
+        FileService::new(Arc::new(NoopBroadcaster), vec![root.to_path_buf()])
+    }
+
+    /// Assert neither the `Display` nor the `Debug` rendering names the path — a
+    /// message-only check would miss a payload still carrying it.
+    fn assert_path_absent(err: &FileError, needle: &str) {
+        let rendered = format!("{err}");
+        let debug = format!("{err:?}");
+        for haystack in [&rendered, &debug] {
+            assert!(
+                !haystack.contains(needle),
+                "identity-addressed error must not disclose the resolved path, got {haystack:?}"
+            );
+        }
+    }
+
+    /// No-op broadcaster for constructing a service in tests.
+    struct NoopBroadcaster;
+    impl EventBroadcaster for NoopBroadcaster {
+        fn broadcast(&self, _event: aionui_api_types::WebSocketMessage<serde_json::Value>) {}
+    }
+
     #[test]
     fn get_file_metadata_sync_image_mime() {
         let dir = tempfile::tempdir().unwrap();
@@ -1264,6 +1512,65 @@ mod tests {
 
         let result = copy_single_file_sync(&src, &dest);
         assert!(result.is_err());
+    }
+
+    // -- candidate_name / split_ext tests (auto-rename, mirrors WS transfer) --
+
+    #[test]
+    fn candidate_name_scheme_matches_ws_transfer() {
+        // attempt 0 keeps the original; 1 appends " copy"; N≥2 appends " copy N".
+        assert_eq!(candidate_name("report.txt", 0, false), "report.txt");
+        assert_eq!(candidate_name("report.txt", 1, false), "report copy.txt");
+        assert_eq!(candidate_name("report.txt", 2, false), "report copy 2.txt");
+        // Directories take the suffix wholesale (no extension split).
+        assert_eq!(candidate_name("assets", 1, true), "assets copy");
+        assert_eq!(candidate_name("assets.v2", 1, true), "assets.v2 copy");
+        // Dotfiles are not split on the leading dot.
+        assert_eq!(candidate_name(".env", 1, false), ".env copy");
+    }
+
+    #[test]
+    fn split_ext_splits_at_last_interior_dot_only() {
+        assert_eq!(split_ext("a.tar.gz"), ("a.tar", ".gz"));
+        assert_eq!(split_ext("noext"), ("noext", ""));
+        assert_eq!(split_ext(".gitignore"), (".gitignore", ""));
+    }
+
+    // -- free_dest_path tests (never overwrite) --
+
+    #[test]
+    fn free_dest_path_returns_original_when_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = free_dest_path(dir.path(), "a.txt", false).unwrap();
+        assert_eq!(dest, dir.path().join("a.txt"));
+    }
+
+    #[test]
+    fn free_dest_path_avoids_existing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        fs::write(dir.path().join("a copy.txt"), "").unwrap();
+        let dest = free_dest_path(dir.path(), "a.txt", false).unwrap();
+        assert_eq!(dest, dir.path().join("a copy 2.txt"));
+    }
+
+    // -- copy_dir_recursive_sync tests (OS-external directory drop) --
+
+    #[test]
+    fn copy_dir_recursive_sync_copies_nested_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(src.join("nested/deep")).unwrap();
+        fs::write(src.join("top.txt"), "top").unwrap();
+        fs::write(src.join("nested/mid.txt"), "mid").unwrap();
+        fs::write(src.join("nested/deep/leaf.txt"), "leaf").unwrap();
+
+        let dest = root.path().join("dest");
+        copy_dir_recursive_sync(&src, &dest).unwrap();
+
+        assert_eq!(fs::read_to_string(dest.join("top.txt")).unwrap(), "top");
+        assert_eq!(fs::read_to_string(dest.join("nested/mid.txt")).unwrap(), "mid");
+        assert_eq!(fs::read_to_string(dest.join("nested/deep/leaf.txt")).unwrap(), "leaf");
     }
 
     // -- get_image_base64_sync tests (task 7.6) --

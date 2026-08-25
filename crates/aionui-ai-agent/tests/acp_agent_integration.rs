@@ -179,6 +179,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::Plan(_) => "Plan",
         AgentStreamEvent::Permission(_) => "Permission",
         AgentStreamEvent::AcpPermission(_) => "AcpPermission",
+        AgentStreamEvent::Ask(_) => "Ask",
         AgentStreamEvent::AcpToolCall(_) => "AcpToolCall",
         AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
         AgentStreamEvent::SkillSuggest(_) => "SkillSuggest",
@@ -188,6 +189,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::AcpConfigOption(_) => "AcpConfigOption",
         AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
         AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
+        AgentStreamEvent::AcpTerminalOutput(_) => "AcpTerminalOutput",
         AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
         AgentStreamEvent::Finish(_) => "Finish",
         AgentStreamEvent::Error(_) => "Error",
@@ -199,6 +201,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
         AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
         AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+        AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
     }
 }
 

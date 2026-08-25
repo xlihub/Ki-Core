@@ -259,6 +259,9 @@ pub enum AgentKillReason {
     /// `team_mcp_stdio_config`. The conversation is preserved; only the
     /// in-memory ACP CLI is recycled.
     TeamMcpRebuild,
+    /// A Team member is being rebuilt after its persisted backend session
+    /// anchor was cleared. The conversation row and visible history remain.
+    TeamContextReset,
     /// Team is being deleted; every agent process under it must be torn
     /// down before the team's conversations / rows are removed.
     TeamDeleted,
@@ -270,28 +273,22 @@ pub enum AgentKillReason {
     /// watchdog timeout. The stale ACP process is recycled while the user turn
     /// is treated as a clean cancellation.
     UserCancelTimeout,
+    /// The user explicitly requested a runtime restart. Any active turn is
+    /// intentionally cancelled and must converge without a user-facing error
+    /// before the old process is replaced.
+    RuntimeRestart,
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
     /// The owning user's Core session was revoked, so foreground runtime state
     /// and agent processes for that user must be torn down.
     SessionRevoked,
-}
-
-/// Preview content type for document preview history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PreviewContentType {
-    Markdown,
-    Diff,
-    Code,
-    Html,
-    Pdf,
-    Ppt,
-    Word,
-    Excel,
-    Image,
-    Url,
+    /// The owning conversation (or its team) was archived. Like
+    /// `ConversationDeleted` the agent process is torn down so it stops
+    /// streaming for a unit the user moved out of the active workspace, but the
+    /// conversation row and history are preserved — unarchiving cold-starts a
+    /// fresh agent.
+    Archived,
 }
 
 /// File change operation type.

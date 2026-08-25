@@ -2,10 +2,11 @@
 
 use std::time::Instant;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use aionui_app::{AppConfig, IdentityMode};
 use aionui_db::Database;
+use aionui_runtime::ShellProbeStatus;
 
 use crate::cli::Cli;
 
@@ -26,14 +27,37 @@ pub struct ServerEnvironment {
 /// Cheap, synchronous, no IO beyond creating the log directory.
 /// All subcommands that need logging and config should call this first.
 pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironment, BootstrapError> {
-    let log_dir = cli.log_dir.clone().unwrap_or_else(|| cli.data_dir.join("logs"));
-    let log_guard = init_tracing(&log_dir, cli.log_level.as_deref())?;
+    // A custom --log-dir that cannot be created must not permanently brick
+    // bootstrap (AIONUI-231): init_tracing falls back to the default dir.
+    let default_log_dir = cli.data_dir.join("logs");
+    let log_guard = init_tracing(cli.log_dir.as_deref(), &default_log_dir, cli.log_level.as_deref())?;
 
     info!(
         path_segments = merged_path.split(if cfg!(windows) { ';' } else { ':' }).count(),
         path_len = merged_path.len(),
         "startup: PATH ready"
     );
+
+    // The login-shell PATH probe runs in `main`, before `init_tracing`, so its
+    // own logging goes nowhere. Replay the outcome here: a probe that timed out
+    // used to leave no trace on either log sink, which made a hung startup
+    // indistinguishable from a crash (AIONUI-150). Status and duration only —
+    // never the PATH itself.
+    match aionui_runtime::login_shell_probe_report() {
+        // A timed-out probe is the AIONUI-150 signature and must be visible at
+        // production's default `info` threshold.
+        Some(probe) if probe.status == ShellProbeStatus::TimedOut => warn!(
+            probe_status = probe.status.as_str(),
+            probe_elapsed_ms = probe.elapsed_ms,
+            "startup: login-shell PATH probe timed out; continuing with the inherited PATH"
+        ),
+        Some(probe) => info!(
+            probe_status = probe.status.as_str(),
+            probe_elapsed_ms = probe.elapsed_ms,
+            "startup: login-shell PATH probe finished"
+        ),
+        None => {}
+    }
 
     let work_dir = resolve_work_dir(cli.work_dir.clone(), &cli.data_dir);
 
@@ -134,19 +158,33 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
         },
     )
     .await
-    .map_err(|e| {
-        let stage = e.stage();
-        BootstrapError::new(
-            BootstrapErrorCode::DataInitFailed,
-            stage,
-            "failed to initialize application data",
-        )
-        .with_source(e.into_source())
-        .with_field("databasePath", db_path.display().to_string())
-    })?;
+    .map_err(|e| database_init_bootstrap_error(e, &db_path))?;
     info!(elapsed_ms = boot.elapsed().as_millis(), "startup: database initialized");
 
     Ok(database)
+}
+
+/// Map a database init failure to the bootstrap boundary error.
+///
+/// For the downgrade stage (`database.newer_than_app`) the stderr line carries
+/// both migration versions so the host and production logs can tell the user
+/// which release the database requires, without exposing the raw source error.
+fn database_init_bootstrap_error(error: aionui_db::DatabaseInitError, db_path: &std::path::Path) -> BootstrapError {
+    let stage = error.stage();
+    let source = error.into_source();
+    let mut bootstrap_error = BootstrapError::new(
+        BootstrapErrorCode::DataInitFailed,
+        stage,
+        "failed to initialize application data",
+    )
+    .with_field("databasePath", db_path.display().to_string());
+    if let Some(db_version) = source.missing_migration_version() {
+        bootstrap_error = bootstrap_error.with_field("dbMigrationVersion", db_version.to_string());
+        if let Some(app_version) = aionui_db::latest_known_migration_version() {
+            bootstrap_error = bootstrap_error.with_field("appMigrationVersion", app_version.to_string());
+        }
+    }
+    bootstrap_error.with_source(source)
 }
 
 #[cfg(test)]
@@ -184,6 +222,42 @@ mod tests {
         );
 
         assert_eq!(err.stage(), "database.recoverable_corruption");
+    }
+
+    #[test]
+    fn newer_than_app_stage_carries_migration_versions_on_stderr() {
+        let err = aionui_db::DatabaseInitError::new(
+            aionui_db::DATABASE_NEWER_THAN_APP_STAGE,
+            aionui_db::DbError::Migration(sqlx::migrate::MigrateError::VersionMissing(39)),
+        );
+
+        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/aionui-backend.db"));
+        let line = bootstrap.stderr_line();
+        assert!(
+            line.starts_with("BOOTSTRAP_DATA_INIT_FAILED stage=database.newer_than_app"),
+            "{line}"
+        );
+        assert!(line.contains("dbMigrationVersion=39"), "{line}");
+        let app_version = aionui_db::latest_known_migration_version().unwrap();
+        assert!(line.contains(&format!("appMigrationVersion={app_version}")), "{line}");
+        // The raw sqlx message stays out of stderr (boundary contract).
+        assert!(!line.contains("previously applied"), "{line}");
+    }
+
+    #[test]
+    fn generic_database_failures_do_not_carry_migration_versions() {
+        let err = aionui_db::DatabaseInitError::new(
+            "database.migration",
+            aionui_db::DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(7)),
+        );
+
+        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/aionui-backend.db"));
+        let line = bootstrap.stderr_line();
+        assert!(
+            line.starts_with("BOOTSTRAP_DATA_INIT_FAILED stage=database.migration"),
+            "{line}"
+        );
+        assert!(!line.contains("MigrationVersion"), "{line}");
     }
 
     #[test]

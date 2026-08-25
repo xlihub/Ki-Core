@@ -138,10 +138,15 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// - `init.mcp_servers` → `--mcp-config <json>` + `--strict-mcp-config` (the latter
 ///   ONLY alongside `--mcp-config`: it makes the session ignore the machine's
 ///   ambient `~/.claude` servers, which we must NOT do when we inject none).
-/// - `init.preset_context` → `--system-prompt` (composed `[Assistant Rules]` /
-///   skills index / team-guide text, already assembled by the app boundary).
-/// - `model` → `--model`; `mode` → `--permission-mode` (claude has no in-band
-///   switch at spawn; a UI switch persists + evicts so the rebuild re-applies here).
+/// - `init.preset_context` → `--append-system-prompt` (composed `[Assistant Rules]` /
+///   skills index / team-guide text, already assembled by the app boundary). It MUST be
+///   the APPEND flag: `--system-prompt` REPLACES claude's built-in prompt wholesale
+///   ("System prompt to use for the session" vs "Append a system prompt to the default
+///   system prompt", verified: `claude --help`, 2.1.234), silently stripping the
+///   harness's own guidance — the same defect class as codex `baseInstructions`.
+/// - `mode` → `--permission-mode` (claude has no in-band switch at spawn; a UI switch
+///   persists + evicts so the rebuild re-applies here). `model` is deliberately NOT
+///   mapped to `--model` — see the comment at the end of this fn.
 ///
 /// claude's `--mcp-config` uses a MAP shape `{"mcpServers":{"<name>":{…}}}` (NOT the
 /// ACP array), so this builds its own JSON rather than reusing `acp_conn`'s array
@@ -156,7 +161,7 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        args.push("--system-prompt".to_string());
+        args.push("--append-system-prompt".to_string());
         args.push(preset.to_string());
     }
 
@@ -231,23 +236,34 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // syscall-free fn.
     args.push("--allow-dangerously-skip-permissions".to_string());
 
-    // TEMPORARY: disable AskUserQuestion until the multi-question interactive card is
-    // ported to the current frontend. claude's AskUserQuestion can ask several
-    // questions at once (`{questions:[…]}`), but the active frontend only renders a
-    // single-question permission card, so a multi-question ask would silently drop all
-    // but the first. Rather than ship that half-answer behaviour, deny the tool at
-    // spawn time — claude then falls back to plain-text questions, which render fully.
-    // Mirrors the official @agentclientprotocol/claude-agent-acp adapter, which
-    // likewise lists `AskUserQuestion` in `disallowedTools` for the same reason
-    // ("not a great way to expose this over ACP at the moment"). Remove once the
-    // frontend gains a multi-question renderer.
-    args.push("--disallowed-tools".to_string());
-    args.push("AskUserQuestion".to_string());
+    // AskUserQuestion is ENABLED: the frontend now renders a real multi-question
+    // card fed by `SessionEvent::Ask` and answers through `Command::AnswerAsk`
+    // (2026-08-04 spec 2026-08-04-askuserquestion-统一问询设计.md). This used to be
+    // `--disallowed-tools AskUserQuestion` while the active frontend could only
+    // show a single-question permission card — removing the flag is the claude
+    // half of P0; the adapter routes the tool to `Ask`, never to `Permission`.
 
-    if let Some(model) = config.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("--model".to_string());
-        args.push(model.to_string());
-    }
+    // NO `--model` FLAG — the selection is applied in-band via
+    // `control_request{set_model}` after the spawn (see `apply_desired_model`).
+    //
+    // The flag would carry the model itself just fine. It is disqualified because it ALSO
+    // reshapes the catalog we persist for the picker (LIVE-PROBED 2.1.231): the
+    // `initialize` reply's `models[]` is a FUNCTION of this flag —
+    //   no flag          → 6 rows, the last being the `ANTHROPIC_MODEL` one
+    //                      (e.g. `claude-opus-5[1m]` / "Opus 5 (1M context)")
+    //   --model default  → 6 rows, but that last row becomes "Opus 4.8 (1M context)"
+    //   --model opus     → 5 rows, the last row is gone entirely
+    // The catalog is persisted per-AGENT (last write wins), so a session spawned on an
+    // alias ERASED a model the picker was offering every other conversation, and the
+    // `ANTHROPIC_MODEL` row was unreachable no matter what the user picked. Spawning
+    // flagless makes the catalog constant AND identical to what `/model` lists in the
+    // terminal; `set_model` then carries the selection without touching it (probed: the
+    // catalog is still those 6 rows after a set_model).
+    //
+    // `set_model` applies before the first turn (init reports the switched model) and is
+    // re-applied on every `--resume` respawn, because claude does NOT restore a session's
+    // model on resume (LIVE-PROBED: resume with neither flag nor set_model reports the
+    // config-resolved model, not the one the session had been switched to).
 
     args
 }
@@ -352,6 +368,14 @@ impl BackendConnection for ClaudeConnection {
         // first `capabilities()` read; a late response is merged on the next read
         // (same late-discovery contract as codex `model/list`).
         backend.request_initialize().await;
+        // Apply the model selection in-band (the removed `--model` flag's replacement).
+        // Ordered AFTER initialize purely for log readability — both are written before
+        // any prompt, which is all the ordering the CLI requires.
+        backend.apply_desired_model().await;
+        // Report a claude whose version differs from the release AionUi
+        // verified. claude runs from the user's own install (nothing is
+        // bundled), so this is the same situation agy has always been in.
+        backend.spawn_version_check();
         Ok(Arc::new(backend))
     }
 
@@ -431,14 +455,19 @@ pub struct ClaudeSessionBackend {
     /// into `available_models`/`slash_commands` on read. Empty until the response
     /// lands (a freshly-opened backend reads empty, like codex pre-`model/list`).
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
-    /// G2 (in-band config switch): control_requests (`set_model` /
-    /// `set_permission_mode`) deferred because they arrived mid-turn. Writing one
-    /// while a turn is Running would reinitialize the CLI session and TRUNCATE the
-    /// in-flight turn (raw-CLI limitation), so `dispatch(SetMode/SetModel)` QUEUES
-    /// the frame here and `dispatch(Send)` drains it — in order, over the same
-    /// stdin lock, BEFORE the prompt — so a queued switch applies to the NEXT turn
-    /// and can never land after-and-truncate it. De-duped by subtype (last-write-
-    /// wins). Mirrors F1's `pending_controls`.
+    /// G2 (in-band config switch): control_requests deferred because they arrived
+    /// mid-turn. `dispatch(Send)` drains them — in order, over the same stdin lock,
+    /// BEFORE the prompt — so a queued switch applies to the NEXT turn. De-duped by
+    /// subtype (last-write-wins). Mirrors F1's `pending_controls`.
+    ///
+    /// Now holds only `set_model` / `apply_flag_settings`. `set_permission_mode` is
+    /// written straight through (see `write_or_queue_control`): a 2.1.227 probe
+    /// disproved the truncation theory this queue was built on, and because draining
+    /// only happens on the next prompt, queueing left a switch unsent — and unapplied —
+    /// for as long as the user did not send another message.
+    ///
+    /// The remaining two keep queueing only because no equivalent capture exists for
+    /// them yet, not because truncation is known to occur.
     pending_controls: Arc<Mutex<Vec<serde_json::Value>>>,
     /// Monotonic counter minting `control_request` request_ids (no uuid dep). The
     /// CLI echoes it in its success control_response (observed by the reader, not
@@ -468,21 +497,64 @@ pub struct ClaudeSessionBackend {
     /// One-shot first-turn title generation (spec 2026-08-04). Shared with the
     /// reader via `reader_state`; `dispatch(Send)` records the first prompt text.
     title_gen: Arc<TitleGenState>,
+    /// The model row id to ask claude for via in-band `set_model`, `None` when the
+    /// session carries NO selection (see `desired_model_from_config`). Applied after the
+    /// initialize request at open, RE-APPLIED after every F-4 wake (claude does NOT
+    /// restore a session's model on `--resume`, LIVE-PROBED 2.1.231), and rewritten by
+    /// `dispatch(SetModel)` so a wake re-applies the user's CURRENT pick. Shared with
+    /// the reader, which checks it against `system/init` (`reconcile_init_model`).
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// One-shot first-turn session-title generation state (spec 2026-08-04).
+/// The `set_model` target for a config selection, or `None` when nothing should be sent.
+///
+/// EVERY row of claude's catalog is sent verbatim, `default` included. The two states are
+/// distinguished by PRESENCE, not by value:
+///
+/// - **no selection** (`None`/empty) → send nothing → claude resolves the model from the
+///   user's own config (`ANTHROPIC_MODEL`, else the account default), which is exactly
+///   what the terminal CLI does on startup.
+/// - **`default`** → send it → claude runs the ACCOUNT default, overriding
+///   `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231: with `ANTHROPIC_MODEL=claude-opus-5[1m]`,
+///   `set_model{default}` and `--model default` both report `claude-opus-4-8[1m]` in
+///   `system.init.model`). That IS the semantic of the CLI's own `Default` row — its
+///   description reads "Use the default model (currently Opus 4.8 (1M context))" — so
+///   suppressing it made the picker contradict itself: the row promised 4.8 and the
+///   session ran opus-5.
+///
+/// Do NOT re-add a `default` special case here. The distinction belongs upstream: a
+/// session with no user pick must carry no model at all, not the literal `default`.
+fn desired_model_from_config(model: Option<&str>) -> Option<String> {
+    model.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// First-turn session-title generation state (spec 2026-08-04, retry semantics
+/// 2026-08-13).
 ///
 /// `pending` latches true only for a `SessionSpec::Fresh` open (a brand-new
 /// conversation; a Resume — even one that rebinds a fresh claude session after
-/// a lost backend — belongs to an existing conversation and never fires). The
-/// reader swaps it false on the first successful `TurnResult` and fires a
+/// a lost backend — belongs to an existing conversation and never fires).
+/// Every successful `TurnResult` while the latch is armed fires a
 /// `control_request{generate_session_title, persist:true}` over the shared
 /// stdin; `sniff_session_title` turns the success control_response into
-/// `SessionEvent::SessionTitle`. Fire-and-forget: any failure is logged and
-/// dropped — title generation must never affect the turn path.
+/// `SessionEvent::SessionTitle`. The latch is completed ONLY by a non-empty
+/// title reply: an error/empty reply, a reply timeout (30s, per spec), or a
+/// failed write keeps it armed so the next successful turn retries, bounded by
+/// [`TITLE_MAX_ATTEMPTS`]. Live 2026-08-13: claude 2.1.227 answered 12/12 title
+/// requests in 1-3s for the exact descriptions of two production conversations
+/// stuck on their placeholder names, proving the loss is on our side (silent
+/// unanswered request / lost latch) — hence retries + full observability here.
+/// Title generation must never affect the turn path.
 struct TitleGenState {
     pending: std::sync::atomic::AtomicBool,
+    /// Control requests actually reserved (== fired or attempted-to-fire).
+    attempts: std::sync::atomic::AtomicU32,
+    /// The in-flight title request awaiting a reply, keyed by its request_id.
+    /// One outstanding request at a time; cleared by the reply (any outcome),
+    /// the 30s watchdog, or a failed write.
+    inflight: std::sync::Mutex<Option<String>>,
     /// First user prompt text of the first turn — the generation `description`.
+    /// Cloned (not consumed) on fire so retries keep the user part.
     /// Prompt content: never logged (see AGENTS.md logging rules).
     description: std::sync::Mutex<Option<String>>,
     /// The backend's shared stdin slot (same Arc as `ClaudeSessionBackend.stdin`).
@@ -491,6 +563,11 @@ struct TitleGenState {
     /// Shared `ctl-N` counter (same Arc as `ClaudeSessionBackend.control_seq`).
     control_seq: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Max title control requests per session (initial try + retries).
+const TITLE_MAX_ATTEMPTS: u32 = 3;
+/// Reply watchdog, per spec 2026-08-04 ("超时 30s"). Live: replies land in 1-3s.
+const TITLE_REPLY_TIMEOUT_SECS: u64 = 30;
 
 impl TitleGenState {
     /// Fire the one-shot `generate_session_title` control_request on a detached
@@ -505,6 +582,28 @@ impl TitleGenState {
     /// titles reliably ("User:…/Assistant:…" → "Git 版本控制系统介绍").
     fn fire(self: &Arc<Self>, session_id: &str, result_text: &str) {
         use std::sync::atomic::Ordering;
+        // Reserve synchronously on the reader thread: one outstanding request
+        // at a time, bounded total attempts (failed writes count — the cap is a
+        // safety bound, not an exact retry budget).
+        let request_id = {
+            let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            if inflight.is_some() {
+                return;
+            }
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt > TITLE_MAX_ATTEMPTS {
+                self.pending.store(false, Ordering::SeqCst);
+                tracing::warn!(
+                    session_id,
+                    max_attempts = TITLE_MAX_ATTEMPTS,
+                    "generate_session_title exhausted retries; conversation keeps its placeholder name"
+                );
+                return;
+            }
+            let id = format!("{TITLE_PREFIX}{}", self.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            *inflight = Some(id.clone());
+            id
+        };
         let this = self.clone();
         let session_id = session_id.to_string();
         let assistant_part: String = result_text.chars().take(1000).collect();
@@ -513,7 +612,7 @@ impl TitleGenState {
                 .description
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take()
+                .clone()
                 .unwrap_or_default();
             let mut description = String::new();
             if !user_part.is_empty() {
@@ -527,7 +626,7 @@ impl TitleGenState {
                 description.push_str("Assistant: ");
                 description.push_str(&assistant_part);
             }
-            let request_id = format!("{TITLE_PREFIX}{}", this.control_seq.fetch_add(1, Ordering::SeqCst) + 1);
+            let description_len = description.chars().count();
             let frame = serde_json::json!({
                 "type": "control_request",
                 "request_id": request_id,
@@ -537,15 +636,65 @@ impl TitleGenState {
                     "persist": true,
                 },
             });
-            let mut guard = this.stdin.lock().await;
-            let Some(stdin) = guard.as_mut() else {
-                tracing::debug!(session_id, "generate_session_title not sent: stdin unavailable");
-                return;
-            };
-            if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
-                tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+            {
+                let mut guard = this.stdin.lock().await;
+                let Some(stdin) = guard.as_mut() else {
+                    // Nothing went out: release the slot so the next successful
+                    // turn can retry. warn (not debug): a lost title attempt must
+                    // be diagnosable from production logs.
+                    this.clear_inflight(&request_id);
+                    tracing::warn!(session_id, "generate_session_title not sent: stdin unavailable");
+                    return;
+                };
+                if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
+                    this.clear_inflight(&request_id);
+                    tracing::warn!(session_id, error = %e, "generate_session_title control_request write failed");
+                    return;
+                }
+            }
+            let attempt = this.attempts.load(Ordering::SeqCst);
+            tracing::info!(
+                session_id,
+                request_id = %request_id,
+                attempt,
+                description_len,
+                "generate_session_title sent"
+            );
+            // Reply watchdog: if claude never answers, release the slot and log
+            // so the next successful turn retries (spec's 30s timeout; the old
+            // fire-and-forget lost these silently).
+            tokio::time::sleep(std::time::Duration::from_secs(TITLE_REPLY_TIMEOUT_SECS)).await;
+            if this.clear_inflight(&request_id) {
+                tracing::warn!(
+                    session_id,
+                    request_id = %request_id,
+                    timeout_secs = TITLE_REPLY_TIMEOUT_SECS,
+                    "generate_session_title reply timed out; will retry on the next successful turn"
+                );
             }
         });
+    }
+
+    /// Clear `inflight` iff it still holds `request_id`; true when this call
+    /// cleared it (reply and watchdog race benignly through this guard).
+    fn clear_inflight(&self, request_id: &str) -> bool {
+        let mut guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_deref() == Some(request_id) {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A reply for `request_id` was observed. A usable (non-empty) title
+    /// completes the latch; any other outcome only releases the in-flight slot
+    /// so the next successful turn retries.
+    fn on_reply(&self, request_id: &str, got_title: bool) {
+        self.clear_inflight(request_id);
+        if got_title {
+            self.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -599,6 +748,16 @@ struct ClaudeWakeRecipe {
 struct DiscoveredCaps {
     models: Vec<crate::capability::ModelInfo>,
     slash_commands: Vec<crate::capability::SlashCommandInfo>,
+    /// Row id → the CONCRETE model that row resolves to, from the initialize
+    /// reply's `models[].resolvedModel` (LIVE-PROBED 2.1.231:
+    /// `{"value":"haiku","resolvedModel":"claude-haiku-4-5"}`).
+    ///
+    /// This is the ONLY basis for checking that an in-band `set_model` landed:
+    /// `system.init.model` reports the RESOLVED id, while our selection is the ROW
+    /// id, and no other field bridges the two (`displayName` is "Default" / "Fable"
+    /// for those rows). Kept private to this module — the reconcile is the only
+    /// consumer today, so it does not need to ride `ModelInfo` across the seam.
+    resolved_models: std::collections::HashMap<String, String>,
 }
 
 /// Session-cumulative cost ledger. claude's `result.total_cost_usd` is
@@ -657,6 +816,12 @@ struct ClaudeReaderState {
     /// reader overwrites it from `system/init` so a post-fork / post-rotation
     /// wake resumes the sid claude actually reported, never the stale spawn id.
     wake_session_slot: Arc<std::sync::Mutex<String>>,
+    /// The model row id we ask claude for via in-band `set_model`, or `None` for the
+    /// "Default" row (which is expressed by sending NOTHING — see
+    /// `build_claude_init_args`). Shared Arc with the backend, which re-applies it on
+    /// every wake and rewrites it on a user switch; the reader only reads it, to check
+    /// the applied model against `system/init` (`reconcile_init_model`).
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Spawn a claude stdout reader over `stdout`/`io` using the shared state. Used
@@ -701,6 +866,7 @@ fn start_claude_reader(
             state.cost_ledger,
             state.title_gen,
             state.wake_session_slot,
+            state.desired_model,
         )
         .await;
     })
@@ -751,9 +917,12 @@ impl ClaudeSessionBackend {
         let stdin = Arc::new(Mutex::new(stdin));
         let control_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         // Spec 2026-08-04: only a Fresh open (brand-new conversation) arms the
-        // one-shot first-turn title generation.
+        // first-turn title generation (completed by a non-empty title reply,
+        // retried otherwise — see TitleGenState).
         let title_gen = Arc::new(TitleGenState {
             pending: std::sync::atomic::AtomicBool::new(fresh),
+            attempts: std::sync::atomic::AtomicU32::new(0),
+            inflight: std::sync::Mutex::new(None),
             description: std::sync::Mutex::new(None),
             stdin: stdin.clone(),
             adapter: adapter.clone(),
@@ -778,6 +947,15 @@ impl ClaudeSessionBackend {
             last_raw: 0.0,
         }));
 
+        // The selection to apply in-band, `None` for "Default" (see
+        // `desired_model_from_config`). Shared with the reader (landed-check) and
+        // rewritten by dispatch(SetModel) so a later wake re-applies the CURRENT pick,
+        // not the open-time one — which the old `--model` arg could not do, since the
+        // wake recipe replays the spawn args verbatim.
+        let desired_model = Arc::new(std::sync::Mutex::new(desired_model_from_config(
+            config.model.as_deref(),
+        )));
+
         let reader_state = ClaudeReaderState {
             session_id: session_id.clone(),
             turn_gen: turn_gen.clone(),
@@ -792,6 +970,7 @@ impl ClaudeSessionBackend {
             cost_ledger,
             title_gen: title_gen.clone(),
             wake_session_slot: wake.claude_session_id.clone(),
+            desired_model: desired_model.clone(),
         };
         let reader = start_claude_reader(&reader_state, stdout, io.clone());
 
@@ -848,6 +1027,7 @@ impl ClaudeSessionBackend {
             current_mode_override,
             pending_set_config,
             title_gen,
+            desired_model,
         }
     }
 
@@ -890,6 +1070,11 @@ impl ClaudeSessionBackend {
         // writes to the woken process (the old stdin dropped with the old io).
         *self.stdin.lock().await = stdin;
         let reader = start_claude_reader(&self.reader_state, stdout, io.clone());
+        // Re-apply the model selection to the FRESH process: `--resume` does not carry
+        // it (LIVE-PROBED 2.1.231 — a resumed session reports the default model), and it
+        // is no longer in `wake.extra_args` either. Reads the shared slot, so a
+        // mid-session switch is what gets re-applied, not the open-time pick.
+        self.apply_desired_model().await;
         Ok(ProcHandle::new(reader, io))
     }
 
@@ -935,14 +1120,90 @@ impl ClaudeSessionBackend {
             request_id = %request_id,
             "claude control_response (permission answer) written to stdin"
         );
-        // RA -1: the reducer leaves requires-action only on PermissionResolved.
+        // RA -1: resolve the SAME counter the originating event incremented. An
+        // AskUserQuestion raised `Ask` (waiting_on_question), and the REST
+        // recovery card answers it through THIS legacy AnswerPermission path
+        // (Confirmation options carry the answer labels) — emitting
+        // PermissionResolved here would decrement waiting_on_approval instead,
+        // leaving waiting_on_question pinned at >0 and the session locked out of
+        // can_send forever after a recovered ask is answered.
+        let cur_gen = self.turn_gen.load(Ordering::SeqCst);
+        let resolve_event = if pending.tool_name == "AskUserQuestion" {
+            SessionEvent::AskResolved {
+                request_id: request_id.to_string(),
+            }
+        } else {
+            SessionEvent::PermissionResolved {
+                request_id: request_id.to_string(),
+                kind: crate::event::PermissionKind::Tool,
+            }
+        };
+        let _ = self.event_tx.send(SessionEnvelope {
+            session_id: self.session_id.clone(),
+            turn_gen: cur_gen,
+            event: resolve_event,
+        });
+        Ok(CommandReceipt {
+            accepted: true,
+            admission: Admission::NoTurn,
+            turn_gen: cur_gen,
+        })
+    }
+
+    /// Wire an AskUserQuestion answer (`Command::AnswerAsk`) to claude's blocking
+    /// `can_use_tool` request. Same pending map + keyed `control_response` as
+    /// `answer_permission` — on the WIRE this is still can_use_tool — but the
+    /// b-side event is `AskResolved` (the question counter), and the decision is
+    /// derived from `answers`: `Some` → allow with `updatedInput.answers`
+    /// (build_control_response's existing AskUserQuestion path), `None` (user
+    /// dismissed the card) → deny. `None` MUST NOT become an allow: claude
+    /// silently drops unanswered questions on allow (live 2.1.178) — that would
+    /// be silent data loss, not a re-ask.
+    async fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<super::types::QuestionAnswer>>,
+    ) -> Result<CommandReceipt, BackendError> {
+        use std::sync::atomic::Ordering;
+        let pending = self
+            .pending_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
+        let Some(pending) = pending else {
+            return Err(BackendError::Transport(format!(
+                "no pending ask for request_id {request_id}"
+            )));
+        };
+        let (decision, answer_slice) = match &answers {
+            Some(list) => (super::types::PermissionDecision::Approved, list.as_slice()),
+            None => (super::types::PermissionDecision::Denied, &[][..]),
+        };
+        let response = build_control_response(request_id, &pending, decision, None, answer_slice);
+        {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard
+                .as_mut()
+                .ok_or_else(|| BackendError::Transport("claude stdin unavailable".into()))?;
+            self.adapter
+                .write_control_response(stdin, &response)
+                .await
+                .map_err(|e| BackendError::Transport(format!("write control_response: {e}")))?;
+        }
+        // Lifecycle marker, same wedge class as permission answers: "user answered
+        // but claude never resumed" hinges on whether this write happened.
+        tracing::info!(
+            conversation_id = %self.session_id,
+            request_id = %request_id,
+            answered = answers.is_some(),
+            "claude control_response (ask answer) written to stdin"
+        );
         let cur_gen = self.turn_gen.load(Ordering::SeqCst);
         let _ = self.event_tx.send(SessionEnvelope {
             session_id: self.session_id.clone(),
             turn_gen: cur_gen,
-            event: SessionEvent::PermissionResolved {
+            event: SessionEvent::AskResolved {
                 request_id: request_id.to_string(),
-                kind: crate::event::PermissionKind::Tool,
             },
         });
         Ok(CommandReceipt {
@@ -950,6 +1211,50 @@ impl ClaudeSessionBackend {
             admission: Admission::NoTurn,
             turn_gen: cur_gen,
         })
+    }
+
+    /// Tell the user once per conversation when the installed claude is not the
+    /// release AionUi verified.
+    ///
+    /// Fire-and-forget: the probe spawns `claude --version` and a failure only
+    /// costs the drift claim, never the session.
+    fn spawn_version_check(&self) {
+        use std::sync::atomic::Ordering;
+        // Both live on the wake recipe — it is what re-spawns the CLI, so it
+        // holds the spawner and the resolved program path.
+        let spawner = Arc::clone(&self.wake.spawner);
+        let session_id = self.session_id.clone();
+        let program = self
+            .wake
+            .cli_program
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("claude"));
+        let event_tx = self.event_tx.clone();
+        let turn_gen = Arc::clone(&self.turn_gen);
+        tokio::spawn(async move {
+            let Some((level, message, localized)) =
+                crate::backend::cli_version::session_drift_notice(&spawner, "claude", &program, &session_id).await
+            else {
+                return;
+            };
+            // Retry until subscribed: a broadcast send with no receiver is
+            // discarded, and this notice has no second chance.
+            crate::backend::cli_version::broadcast_notice(
+                &event_tx,
+                SessionEnvelope {
+                    session_id: session_id.clone(),
+                    turn_gen: turn_gen.load(Ordering::SeqCst),
+                    event: SessionEvent::Notice {
+                        level,
+                        message,
+                        localized: Some(localized),
+                        supersedes_key: None,
+                    },
+                },
+                "claude",
+            )
+            .await;
+        });
     }
 
     /// G2: send a host→CLI `control_request` (set_model / set_permission_mode) over
@@ -1012,8 +1317,26 @@ impl ClaudeSessionBackend {
             "request_id": request_id,
             "request": request,
         });
-        if self.turn_in_flight.load(Ordering::SeqCst) {
-            let subtype = control_subtype(&frame);
+        let subtype = control_subtype(&frame);
+        // `set_permission_mode` is written straight through, even mid-turn.
+        //
+        // LIVE-PROBED 2.1.227 (samples/claude-cli/2.1.227/set_permission_mode/, harness
+        // scripts/probe-claude-set-permission-mode.py): switching mid-generation left the
+        // turn streaming to a normal `result{subtype:"success"}` with 18-32 assistant
+        // frames after the switch, and the new mode governed the very next tool approval
+        // in that SAME turn — proven against a no-switch control run, and symmetric
+        // (loosening skipped the approval prompt, tightening brought it back).
+        //
+        // Queueing it was worse than a delay: `drain_pending_controls` runs only at the
+        // head of `dispatch(Send)`, so a mid-turn switch sat unsent until the user
+        // happened to send another message. Observed live as a switch stuck "pending" for
+        // 3+ minutes with the agent still running under the OLD mode — a safety gap when
+        // the user was TIGHTENING permissions.
+        //
+        // Deliberately narrow: `set_model` and `apply_flag_settings` have no equivalent
+        // capture, so they keep the conservative queue until one exists.
+        let write_through = subtype.as_deref() == Some("set_permission_mode");
+        if !write_through && self.turn_in_flight.load(Ordering::SeqCst) {
             let mut q = self.pending_controls.lock().await;
             q.retain(|f| control_subtype(f) != subtype);
             q.push(frame);
@@ -1080,6 +1403,46 @@ impl ClaudeSessionBackend {
         });
         if let Err(e) = self.write_control_frame(&frame).await {
             tracing::debug!(error = %e, "claude initialize control_request not sent (catalog stays empty)");
+        }
+    }
+
+    /// Apply the session's model selection in-band, the replacement for the removed
+    /// `--model` spawn flag (see `build_claude_init_args` for why the flag had to go).
+    ///
+    /// No-op when the session carries NO selection (`desired_model` is `None`) — that
+    /// intent IS "send nothing", so claude resolves the model from the user's own config
+    /// exactly as the terminal CLI does on startup. A session that DID pick the `default`
+    /// row sends it like any other row (see `desired_model_from_config`).
+    ///
+    /// Must be called on EVERY process run — open AND each F-4 wake — because
+    /// `--resume` does NOT restore the model a session was set to (LIVE-PROBED 2.1.231:
+    /// a resume with no flag and no `set_model` reports the default model in
+    /// `system.init.model`, not the one the previous run had switched to).
+    ///
+    /// Written BEFORE the first prompt, which is what makes it take effect for turn 1:
+    /// claude processes it ahead of `system/init`, so the init frame already reports the
+    /// switched model (LIVE-PROBED 2.1.231) and there is no window where a turn runs on
+    /// the default model. Best-effort like `request_initialize` — a write failure leaves
+    /// the run on the default model, which `reconcile_init_model` then reports.
+    async fn apply_desired_model(&self) {
+        let Some(model) = self.desired_model.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
+        tracing::info!(
+            session_id = %self.session_id,
+            requested_model = %model,
+            "claude applying model selection via in-band set_model"
+        );
+        if let Err(e) = self
+            .write_or_queue_control(serde_json::json!({ "subtype": "set_model", "model": model }))
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                requested_model = %model,
+                error = %e,
+                "claude set_model write failed — the run stays on the default model"
+            );
         }
     }
 
@@ -1289,6 +1652,7 @@ async fn reader_task(
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
     title_gen: Arc<TitleGenState>,
     wake_session_slot: Arc<std::sync::Mutex<String>>,
+    desired_model: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
@@ -1361,6 +1725,12 @@ async fn reader_task(
                     cur_gen,
                     &wake_session_slot,
                 );
+                // Confirm the in-band `set_model` we sent at spawn/wake landed. The
+                // init frame is the ONLY signal for this (a `set_model` sent mid-turn
+                // has no confirmation channel at all — see dispatch(SetModel)), and it
+                // arrives with the first turn of every process run, so a wake's
+                // re-apply is covered too.
+                reconcile_init_model(v, &desired_model, &discovered_caps, &session_id);
                 // #98/#101: sniff the `control_request{initialize}` RESPONSE for the
                 // selectable model list + slash commands (claude's only catalog
                 // channel — the data init frame above carries neither). Fills
@@ -1417,7 +1787,7 @@ async fn reader_task(
                 sniff_session_info(v, &event_tx, &session_id, cur_gen);
                 // First-turn title generation reply (keyed ctl-title-N) →
                 // SessionEvent::SessionTitle. Done on the RAW frame.
-                sniff_session_title(v, &event_tx, &session_id, cur_gen);
+                sniff_session_title(v, &event_tx, &session_id, cur_gen, &title_gen);
                 // Subagent roster: claude emits system/task_* frames for
                 // Task/Workflow subagents (§6b b1). Translate them to
                 // SubagentUpdate so the reducer upserts Running.subagents —
@@ -1459,18 +1829,20 @@ async fn reader_task(
                 // so the flag is already false when subscribers react.
                 if matches!(ev, SessionEvent::TurnResult { .. }) {
                     turn_in_flight.store(false, Ordering::SeqCst);
-                    // Spec 2026-08-04: first SUCCESSFUL turn of a Fresh session
-                    // fires the one-shot generate_session_title (an error turn
-                    // keeps the latch armed for the next successful one). The
-                    // turn's assistant text is passed along — prompt+answer as
-                    // the description keeps the CLI's title generation from
-                    // returning null on short prompts (see TitleGenState::fire).
+                    // Spec 2026-08-04 (+retry 2026-08-13): every SUCCESSFUL turn
+                    // of a Fresh session fires generate_session_title while the
+                    // latch is armed — only a non-empty title reply completes it
+                    // (error/empty/timeout keep it armed; `fire` dedups in-flight
+                    // requests and caps total attempts). The turn's assistant
+                    // text is passed along — prompt+answer as the description
+                    // keeps the CLI's title generation from returning null on
+                    // short prompts (see TitleGenState::fire).
                     if let SessionEvent::TurnResult {
                         is_error: false,
                         result_text,
                         ..
                     } = &ev
-                        && title_gen.pending.swap(false, Ordering::SeqCst)
+                        && title_gen.pending.load(Ordering::SeqCst)
                     {
                         title_gen.fire(&session_id, result_text);
                     }
@@ -1802,6 +2174,150 @@ fn register_or_clear_pending(
     }
 }
 
+/// Report the model this process run is ACTUALLY on, and check it against the in-band
+/// `set_model` we sent at spawn/wake.
+///
+/// Every claude process run gets exactly one `info` line naming the concrete model it is
+/// running. That line is the only production-visible answer to "which model did this
+/// conversation actually use": the picker shows our ROW id (`opus`, `default`), the
+/// `--model` flag is gone, and a "Default" session sends nothing at all — so without it,
+/// the most common case (no explicit selection) would leave no trace whatsoever.
+///
+/// The check on top is needed because claude does NOT validate a model id: neither
+/// `--model <bogus>` nor `set_model{<bogus>}` fails at spawn — the id is echoed back in
+/// `system.init.model` verbatim and the turn only dies with `result{is_error:true}` once
+/// the user sends a message (LIVE-PROBED 2.1.231 for BOTH paths, so this is pre-existing
+/// behaviour, not a cost of going in-band). The primary guard is upstream: the app layer
+/// drops a selection that is not in the catalog before it is ever sent. This is the
+/// backstop for what upstream cannot see — a row that exists but resolves elsewhere, or a
+/// `set_model` claude silently ignored.
+///
+/// Compares against `resolved_models[selection]`, NOT the selection itself:
+/// `system.init.model` reports the RESOLVED concrete id (selection `haiku` → init
+/// `claude-haiku-4-5`).
+///
+/// A run with NO selection sent is reported but never compared, because there is no
+/// catalog row that predicts it: with `ANTHROPIC_MODEL=claude-opus-5[1m]` such a run
+/// reports `claude-opus-5[1m]`, while the closest-looking row (`default`) carries
+/// `resolvedModel: claude-opus-4-8[1m]` — that row describes what happens when `default`
+/// is REQUESTED (it overrides the env), not what an unrequested run resolves to
+/// (LIVE-PROBED 2.1.231, both directions). Comparing the two would fire a false mismatch
+/// on every session that made no pick.
+fn reconcile_init_model(
+    frame: &serde_json::Value,
+    desired_model: &Arc<std::sync::Mutex<Option<String>>>,
+    discovered_caps: &Arc<std::sync::Mutex<DiscoveredCaps>>,
+    session_id: &str,
+) {
+    let desired = desired_model.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let resolved = discovered_caps
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolved_models
+        .clone();
+    match check_init_model(frame, desired.as_deref(), &resolved) {
+        InitModelCheck::NotChecked => {}
+        // No selection was sent, so claude resolved the model from the user's own config
+        // (`ANTHROPIC_MODEL` / account default) exactly as the terminal CLI does.
+        InitModelCheck::ResolvedByCli { running } => tracing::info!(
+            session_id = %session_id,
+            running_model = %running,
+            "claude session model resolved from the user's claude config (no selection sent)"
+        ),
+        InitModelCheck::Applied { requested, running } => tracing::info!(
+            session_id = %session_id,
+            requested_model = %requested,
+            running_model = %running,
+            "claude set_model applied"
+        ),
+        // Reported, but the catalog row is missing (or carries no `resolvedModel`), so
+        // there is nothing to compare against — still worth naming the running model.
+        InitModelCheck::Unverified { requested, running } => tracing::info!(
+            session_id = %session_id,
+            requested_model = %requested,
+            running_model = %running,
+            "claude session running model (selection not verifiable: no catalog row yet)"
+        ),
+        InitModelCheck::Mismatch {
+            requested,
+            expected,
+            running,
+        } => tracing::warn!(
+            session_id = %session_id,
+            requested_model = %requested,
+            expected_model = %expected,
+            running_model = %running,
+            "claude set_model did NOT take effect — the session is running a different model"
+        ),
+    }
+}
+
+/// The pure verdict behind [`reconcile_init_model`], split out so the comparison rules
+/// are unit-testable without a live reader.
+#[derive(Debug, PartialEq, Eq)]
+enum InitModelCheck {
+    /// Not an init frame, or an init frame that names no model — nothing to report.
+    NotChecked,
+    /// No selection was sent; the CLI resolved the model from the user's config.
+    ResolvedByCli {
+        running: String,
+    },
+    Applied {
+        requested: String,
+        running: String,
+    },
+    /// A selection was sent but cannot be checked (no catalog row to resolve it).
+    Unverified {
+        requested: String,
+        running: String,
+    },
+    Mismatch {
+        requested: String,
+        expected: String,
+        running: String,
+    },
+}
+
+fn check_init_model(
+    frame: &serde_json::Value,
+    desired: Option<&str>,
+    resolved_models: &std::collections::HashMap<String, String>,
+) -> InitModelCheck {
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("system")
+        || frame.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return InitModelCheck::NotChecked;
+    }
+    let Some(reported) = frame.get("model").and_then(Value::as_str) else {
+        return InitModelCheck::NotChecked;
+    };
+    let Some(desired) = desired else {
+        return InitModelCheck::ResolvedByCli {
+            running: reported.to_owned(),
+        };
+    };
+    let Some(expected) = resolved_models.get(desired) else {
+        return InitModelCheck::Unverified {
+            requested: desired.to_owned(),
+            running: reported.to_owned(),
+        };
+    };
+    // A selection may be the concrete id itself, in which case the reported id equals it
+    // directly rather than going through the row's resolution.
+    if reported == expected || reported == desired {
+        return InitModelCheck::Applied {
+            requested: desired.to_owned(),
+            running: reported.to_owned(),
+        };
+    }
+    InitModelCheck::Mismatch {
+        requested: desired.to_owned(),
+        expected: expected.clone(),
+        running: reported.to_owned(),
+    }
+}
+
 /// B-CLAUDE-INIT: sniff a raw `system/init` frame for discovery data the legacy
 /// `parse_system` drops. Captures `model` into `discovered_model` (only when
 /// `want_init_model`, i.e. config supplied none) and emits a `Provisioning` event
@@ -2011,6 +2527,21 @@ fn sniff_control_initialize(
                 .collect()
         })
         .unwrap_or_default();
+    // Row id → concrete model, for the `set_model` landed-check (see
+    // `DiscoveredCaps::resolved_models`). Rows without the field are simply absent,
+    // which makes the check skip them rather than report a false mismatch.
+    let resolved_models: std::collections::HashMap<String, String> = models
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| {
+                    let id = m.get("value").and_then(Value::as_str)?.to_string();
+                    let resolved = m.get("resolvedModel").and_then(Value::as_str)?.to_string();
+                    Some((id, resolved))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let parsed_commands: Vec<SlashCommandInfo> = commands
         .map(|commands| {
             commands
@@ -2029,6 +2560,7 @@ fn sniff_control_initialize(
         let mut caps = discovered_caps.lock().unwrap_or_else(|e| e.into_inner());
         if models.is_some() {
             caps.models = parsed_models.clone();
+            caps.resolved_models = resolved_models;
         }
         if commands.is_some() {
             caps.slash_commands = parsed_commands.clone();
@@ -2151,6 +2683,7 @@ fn sniff_set_config_reject(
             level: crate::event::NoticeLevel::Warning,
             message: format!("{label} failed: {err}"),
             localized: None,
+            supersedes_key: None,
         },
     });
 }
@@ -2312,6 +2845,7 @@ fn sniff_session_title(
     event_tx: &broadcast::Sender<SessionEnvelope>,
     session_id: &str,
     turn_gen: u64,
+    title_gen: &TitleGenState,
 ) {
     use serde_json::Value;
     if frame.get("type").and_then(Value::as_str) != Some("control_response") {
@@ -2323,7 +2857,12 @@ fn sniff_session_title(
         return;
     }
     if response.get("subtype").and_then(Value::as_str) != Some("success") {
-        tracing::warn!(session_id, "generate_session_title rejected by claude");
+        title_gen.on_reply(request_id, false);
+        tracing::warn!(
+            session_id,
+            request_id,
+            "generate_session_title rejected by claude; latch kept for retry"
+        );
         return;
     }
     let title = response
@@ -2333,9 +2872,21 @@ fn sniff_session_title(
         .map(str::trim)
         .unwrap_or("");
     if title.is_empty() {
-        tracing::warn!(session_id, "generate_session_title returned no title");
+        title_gen.on_reply(request_id, false);
+        tracing::warn!(
+            session_id,
+            request_id,
+            "generate_session_title returned no title; latch kept for retry"
+        );
         return;
     }
+    title_gen.on_reply(request_id, true);
+    tracing::info!(
+        session_id,
+        request_id,
+        title_len = title.chars().count(),
+        "generate_session_title succeeded"
+    );
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -2388,13 +2939,17 @@ fn sniff_task(
         .map(str::to_string);
     let parent_ref = frame.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
     // Container kind, declared ONLY on `task_started` (`task_type`:
-    // "local_workflow" for a Workflow container, "local_bash" for a background
-    // bash — verified: samples/claude-cli/2.1.176/workflow_*.ndjson +
-    // 2.1.220/_all_workflow_interrupt.jsonl; progress/updated/notification
-    // frames carry no task_type → None). The pump admits ONLY WorkflowContainer
-    // refs into its Finish-suppression roster.
+    // "local_workflow" for a Workflow container, "local_agent" for a Task
+    // subagent, "local_bash" for a background bash — verified:
+    // samples/claude-cli/2.1.176/workflow_*.ndjson +
+    // 2.1.220/_all_workflow_interrupt.jsonl +
+    // tests/fixtures/claude_2.1.169_single_tool_turn.ndjson;
+    // progress/updated/notification frames carry no task_type → None). The pump
+    // admits ONLY WorkflowContainer refs into its Finish-suppression roster;
+    // AgentContainer only changes the progress-card headline downstream.
     let kind = frame.get("task_type").and_then(Value::as_str).map(|t| match t {
         "local_workflow" => crate::event::SubagentTaskKind::WorkflowContainer,
+        "local_agent" => crate::event::SubagentTaskKind::AgentContainer,
         _ => crate::event::SubagentTaskKind::Other,
     });
     let _ = event_tx.send(SessionEnvelope {
@@ -2699,13 +3254,55 @@ impl SessionBackend for ClaudeSessionBackend {
                 })
             }
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
-            Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
+            // B5 mid-turn delivery: a Steer is a DIRECT stdin user-frame write.
+            // claude's persistent stdin accepts writes at any time; the CLI's own
+            // kernel queue decides consumption (next tool_result boundary folds it
+            // into the current turn; a pure-text turn opens a follow-up turn after
+            // its `result` — design spec §6.1/§6甲.2, live 2.1.226). Deliberately
+            // NOT dispatch(Send): no drain_pending_controls (draining is a
+            // next-prompt concern and a Steer opens no prompt), no
+            // turn_in_flight change and NO turn_gen bump — the message folds into
+            // the live turn, and the session pump's per-turn suppression state
+            // must not reset mid-turn (see session_agent's gen-advance reset).
+            // `client_msg_id` is stamped as the user frame's `uuid`, which claude
+            // echoes in `command_lifecycle` (the three-state receipt).
+            Command::Steer { content, client_msg_id } => {
+                let blocks = self.capabilities().prompt_blocks;
+                if let Some(bad) = content.iter().find(|b| !blocks.allows(b)) {
+                    return Err(BackendError::CommandNotSupported {
+                        command: crate::capability::block_kind_name(bad),
+                    });
+                }
+                self.suspend
+                    .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                    .await?;
+                {
+                    let mut guard = self.stdin.lock().await;
+                    let stdin = guard
+                        .as_mut()
+                        .ok_or_else(|| BackendError::Transport("steer: stdin unavailable".into()))?;
+                    self.adapter
+                        .deliver_prompt(stdin, &content, client_msg_id.as_deref())
+                        .await
+                        .map_err(|e| BackendError::Transport(format!("steer deliver_prompt: {e}")))?;
+                } // stdin lock released (microsecond frame-write lock, §5.4)
+                tracing::info!(
+                    conversation_id = %self.session_id,
+                    block_count = content.len(),
+                    "claude dispatch(Steer): mid-turn user frame written to stdin"
+                );
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
             // G2: in-band config switch via control_request (probe-verified, mirrors
             // F1). set_permission_mode / set_model are written over the retained
-            // stdin WITHOUT restarting the process; the switch applies to the NEXT
-            // turn. Mid-turn writes would reinitialize + TRUNCATE the in-flight turn,
-            // so they QUEUE (drained before the next prompt). On a successful
-            // dispatch we emit ConfigChanged so the UI confirms immediately.
+            // stdin WITHOUT restarting the process. set_permission_mode goes out
+            // immediately, even mid-turn, and governs the very next tool approval
+            // (LIVE-PROBED 2.1.227 — see `write_or_queue_control`); set_model still
+            // queues to the next prompt for want of a capture.
             Command::SetMode { mode } => {
                 // DE-OPTIMISTIC (design §9.10.1 option A / README #10): we write the
                 // set_permission_mode request and STOP — no optimistic ConfigChanged, no
@@ -2745,6 +3342,13 @@ impl SessionBackend for ClaudeSessionBackend {
                 // model id surfaces only when the NEXT turn actually tries to use it (API
                 // 404). There is deliberately NO reader-side set_model response parser
                 // (it would be permanently inert + self-confirming — README discipline #9).
+                // Record the new pick so a later F-4 wake re-applies THIS model, not the
+                // open-time one. (Under the old `--model` flag a mid-session switch was
+                // silently lost on wake, because the wake recipe replays the open-time
+                // spawn args verbatim.) `default` maps to None — "send nothing" — so a
+                // woken process resolves the model from the user's config again.
+                *self.desired_model.lock().unwrap_or_else(|e| e.into_inner()) =
+                    desired_model_from_config(Some(model.as_str()));
                 let _ = self
                     .write_or_queue_control(serde_json::json!({ "subtype": "set_model", "model": model.clone() }))
                     .await?;
@@ -2840,6 +3444,9 @@ impl SessionBackend for ClaudeSessionBackend {
                 self.answer_permission(&request_id, decision, selected.as_deref(), &answers)
                     .await
             }
+            // AnswerAsk: the structured-question twin (wire = same can_use_tool
+            // control_response; b-side event = AskResolved on its own counter).
+            Command::AnswerAsk { request_id, answers } => self.answer_ask(&request_id, answers).await,
             // Acknowledge: a conversation-side fold (done-unseen → seen). NO claude
             // wire; accept as a local no-op (§C1).
             Command::Acknowledge { .. } => {
@@ -2876,6 +3483,13 @@ impl SessionBackend for ClaudeSessionBackend {
         // supply one (the snapshot's current_model is None in that case; the reader
         // fills discovered_model from the system/init frame). Read-only sync lock.
         let mut caps = self.capabilities.clone();
+        // Immediate regardless of turn state: `write_or_queue_control` writes
+        // `set_permission_mode` straight through even mid-turn (see there for the probe),
+        // and 2.1.227 shows the ack plus `system/status{permissionMode}` landing within a
+        // millisecond, with the new mode governing the very next tool approval in that
+        // same turn. Left explicit rather than inherited from the static adapter caps so
+        // this stays next to the reason.
+        caps.mode_switch_effect = crate::capability::ModeSwitchEffect::Immediate;
         if caps.current_model.is_none()
             && let Some(model) = self.discovered_model.lock().unwrap_or_else(|e| e.into_inner()).clone()
         {
@@ -3116,12 +3730,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "an unconfigured claude session is gated as `default` (never silently bypassed), \
-             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion denied \
-             (temporary — no multi-question frontend renderer yet)"
+             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion ENABLED \
+             (the Ask card renders multi-question payloads)"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
     }
@@ -3131,6 +3743,12 @@ mod tests {
     /// stdio carrying command/args/env.
     #[test]
     fn build_claude_init_args_mcp_emits_strict_and_map_json() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .stdio
+        );
         let config = SessionConfig {
             init: SessionInit {
                 mcp_servers: vec![McpServerSpec {
@@ -3178,8 +3796,43 @@ mod tests {
         );
     }
 
-    /// preset_context → `--system-prompt`; model → `--model`; mode →
-    /// `--permission-mode`; each omitted independently when its source is empty.
+    /// The assistant preset must NOT replace claude's default system prompt.
+    ///
+    /// `--system-prompt` REPLACES the built-in prompt wholesale (claude 2.1.234
+    /// `--help`: "System prompt to use for the session"), silently stripping
+    /// the harness's own guidance — the same defect class as codex
+    /// `baseInstructions` (#895). The additive flag is `--append-system-prompt`
+    /// ("Append a system prompt to the default system prompt", verified:
+    /// `claude --help`, 2.1.234).
+    #[test]
+    fn preset_context_appends_not_replaces_system_prompt() {
+        let config = SessionConfig {
+            init: SessionInit {
+                preset_context: Some("[Assistant Rules] be precise".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let args = build_claude_init_args(&config);
+        let pair = |flag: &str| -> Option<String> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1).cloned())
+        };
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
+        assert!(
+            !args.iter().any(|a| a == "--system-prompt"),
+            "the preset must not wipe claude's default system prompt"
+        );
+    }
+
+    /// preset_context → `--append-system-prompt`; mode → `--permission-mode`; each
+    /// omitted independently when its source is empty. `model` is deliberately NOT
+    /// mapped to a flag — it is applied in-band via `set_model` (see
+    /// `desired_model_from_config` / `apply_desired_model`).
     #[test]
     fn build_claude_init_args_threads_preset_model_mode() {
         let config = SessionConfig {
@@ -3197,9 +3850,23 @@ mod tests {
                 .position(|a| a == flag)
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        assert_eq!(pair("--system-prompt").as_deref(), Some("[Assistant Rules] be precise"));
-        assert_eq!(pair("--model").as_deref(), Some("global.anthropic.claude-opus-4-8"));
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
         assert_eq!(pair("--permission-mode").as_deref(), Some("plan"));
+        // The model must NOT reach the command line: `--model default` overrides the
+        // user's own ANTHROPIC_MODEL, and any `--model` value reshapes the initialize
+        // catalog we persist for the picker (both LIVE-PROBED 2.1.231). A concrete id is
+        // no exception — the selection travels in-band for every value.
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "the model selection must never be a spawn flag, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "global.anthropic.claude-opus-4-8"),
+            "no bare model value should leak into the args either, got {args:?}"
+        );
 
         // Whitespace-only / empty model & preset are omitted (not emitted as blank
         // flags), but `--permission-mode` is the SECURITY exception: a blank/missing
@@ -3216,7 +3883,9 @@ mod tests {
         };
         let blank_args = build_claude_init_args(&blank);
         assert!(
-            !blank_args.iter().any(|a| a == "--model" || a == "--system-prompt"),
+            !blank_args
+                .iter()
+                .any(|a| a == "--model" || a == "--append-system-prompt"),
             "blank model/preset emit no flags"
         );
         assert_eq!(
@@ -3225,12 +3894,10 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "a blank mode is gated as `default` (never silently bypassed); the unlock flag \
              is always present so a later in-band switch to bypass is accepted; \
-             AskUserQuestion is denied (temporary)"
+             AskUserQuestion is enabled (the Ask card renders multi-question payloads)"
         );
     }
 
@@ -3279,6 +3946,12 @@ mod tests {
     /// http/sse MCP transports map to claude's `{type,url,headers}` entry shape.
     #[test]
     fn build_claude_mcp_config_http_carries_type_and_headers() {
+        assert!(
+            crate::backend::backend_capability_descriptor("claude")
+                .unwrap()
+                .mcp
+                .streamable_http
+        );
         let json_str = build_claude_mcp_config(&[McpServerSpec {
             name: "api".into(),
             transport: McpTransport::Http {
@@ -3291,6 +3964,27 @@ mod tests {
         assert_eq!(json["mcpServers"]["api"]["type"], "http");
         assert_eq!(json["mcpServers"]["api"]["url"], "https://example.com/mcp");
         assert_eq!(json["mcpServers"]["api"]["headers"]["Authorization"], "Bearer x");
+    }
+
+    /// The official claude-code ACP adapter preserves SSE as a distinct
+    /// transport (`type: "sse"`); it must not be collapsed into HTTP.
+    /// verified: ~/.npm/_npx/ca6c9a6e3c4cc822/node_modules/
+    /// @agentclientprotocol/claude-agent-acp/dist/acp-agent.js:1872-1896
+    #[test]
+    fn build_claude_mcp_config_sse_carries_type_and_headers() {
+        assert!(crate::backend::backend_capability_descriptor("claude").unwrap().mcp.sse);
+        let json_str = build_claude_mcp_config(&[McpServerSpec {
+            name: "events".into(),
+            transport: McpTransport::Sse {
+                url: "https://example.com/events".into(),
+                headers: vec![("Authorization".into(), "Bearer x".into())],
+            },
+        }])
+        .expect("sse server -> some json");
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["mcpServers"]["events"]["type"], "sse");
+        assert_eq!(json["mcpServers"]["events"]["url"], "https://example.com/events");
+        assert_eq!(json["mcpServers"]["events"]["headers"]["Authorization"], "Bearer x");
     }
 
     /// SESS-INIT-17 (audit): duplicate MCP server NAMES collapse by construction.
@@ -3855,6 +4549,58 @@ mod tests {
         );
     }
 
+    /// B5 mid-turn delivery: dispatch(Steer) writes a uuid-stamped user frame
+    /// straight to stdin and does NOT bump turn_gen (the message folds into the
+    /// live turn — a bump would reset the session pump's per-turn suppression
+    /// state mid-turn and misattribute the turn's remaining frames).
+    #[tokio::test]
+    async fn dispatch_steer_writes_midturn_user_frame_without_turn_gen_bump() {
+        let io = FakeAgentIo::never_exits(Vec::new());
+        let captured = io.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(io)).await;
+        // Open a turn the normal way so turn_gen has a live value.
+        let send_receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("start the turn".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("send accepted");
+        let steer_receipt = backend
+            .dispatch(Command::Steer {
+                content: vec![ContentBlock::Text("mid-turn interjection".into())],
+                client_msg_id: Some("cmsg-42".into()),
+            })
+            .await
+            .expect("steer accepted");
+        assert_eq!(
+            steer_receipt.admission,
+            Admission::NoTurn,
+            "steer folds into the live turn"
+        );
+        assert_eq!(
+            steer_receipt.turn_gen, send_receipt.turn_gen,
+            "steer must NOT bump turn_gen"
+        );
+        // The stdin→capture copy is a background task; poll briefly.
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("mid-turn interjection") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            written.contains("mid-turn interjection"),
+            "steer text written to stdin, got: {written}"
+        );
+        assert!(
+            written.contains(r#""uuid":"cmsg-42""#),
+            "correlation id stamped as the user frame uuid (claude echoes it via command_lifecycle), got: {written}"
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_commands_are_rejected_by_capability() {
         // Reject matrix: every cap=false command MUST return the EXACT
@@ -3868,7 +4614,9 @@ mod tests {
         assert!(!caps.supported_commands.rewind);
         assert!(!caps.supported_commands.list_checkpoints);
         assert!(!caps.supported_commands.answer_auth);
-        assert!(!caps.supported_commands.steer);
+        // B5: steer is now advertised TRUE (mid-turn stdin write wired); its
+        // accept path is covered by dispatch_steer_writes_midturn_user_frame.
+        assert!(caps.supported_commands.steer);
         // G2: set_mode/set_model are now advertised TRUE (wired in-band).
         assert!(caps.supported_commands.set_mode);
         assert!(caps.supported_commands.set_model);
@@ -3899,10 +4647,6 @@ mod tests {
                 })
                 .await,
             Err(BackendError::CommandNotSupported { command: "answer_auth" })
-        ));
-        assert!(matches!(
-            backend.dispatch(Command::Steer { content: Vec::new() }).await,
-            Err(BackendError::CommandNotSupported { command: "steer" })
         ));
         assert!(matches!(
             backend
@@ -4760,10 +5504,66 @@ mod tests {
         );
     }
 
+    /// A SetMode raised WHILE A TURN IS IN FLIGHT goes out IMMEDIATELY.
+    ///
+    /// It used to be queued until the next prompt, on the theory that a mid-turn control
+    /// write "would reinitialize the CLI session and TRUNCATE the in-flight turn". That
+    /// was the one live-behaviour claim in this file with no captured evidence, and a
+    /// 2.1.227 probe disproved it: switching mid-generation left the turn streaming to a
+    /// normal `result{success}` and took effect within that same turn, in both directions
+    /// (samples/claude-cli/2.1.227/set_permission_mode/, harness
+    /// scripts/probe-claude-set-permission-mode.py).
+    ///
+    /// Queueing was not merely a delay. `drain_pending_controls` runs only at the head of
+    /// `dispatch(Send)`, so a switch made mid-turn sat unsent until the user happened to
+    /// send another message — observed live as a permission change stuck "pending" for
+    /// 3+ minutes while the agent kept running under the OLD mode. For a TIGHTENING
+    /// switch that is a safety gap, not just a stale label.
+    ///
+    /// Scope is deliberately `set_permission_mode` only: `set_model` and
+    /// `apply_flag_settings` have no such capture, so they keep queueing (asserted by
+    /// the test below).
+    #[tokio::test]
+    async fn set_mode_mid_turn_is_written_immediately() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        // First Send → turn_in_flight = true (no terminal ever arrives here).
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("first".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("first Send accepted");
+
+        backend
+            .dispatch(Command::SetMode { mode: "plan".into() })
+            .await
+            .expect("SetMode accepted");
+
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if written.contains("set_permission_mode") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            written.contains("set_permission_mode") && written.contains("\"mode\":\"plan\""),
+            "a mid-turn mode switch must reach the CLI without waiting for the next prompt, got: {written}"
+        );
+    }
+
     /// G2: a SetModel issued WHILE A TURN IS IN FLIGHT is QUEUED (not written
     /// mid-turn, which would truncate the turn) and drained over stdin BEFORE the
     /// next prompt — so the switch applies to the next turn. Proves the queue +
     /// drain ordering: the control_request bytes precede the next user prompt bytes.
+    ///
+    /// Unlike `set_permission_mode` (see above), set_model's mid-turn behaviour has NOT
+    /// been captured, so it keeps the conservative queue.
     #[tokio::test]
     async fn set_model_mid_turn_is_queued_and_drained_before_next_prompt() {
         let fake = FakeAgentIo::never_exits(Vec::new());
@@ -4816,6 +5616,263 @@ mod tests {
         assert!(
             set_model_at < second_prompt_at,
             "the queued set_model must be drained BEFORE the next prompt (else it truncates the turn), got: {written}"
+        );
+    }
+
+    /// "no selection" and "the `default` row" are distinguished by PRESENCE, never by
+    /// value. `default` is a REAL choice — claude runs the account default for it,
+    /// overriding `ANTHROPIC_MODEL` (LIVE-PROBED 2.1.231), which is exactly what the CLI's
+    /// own `Default` row promises ("Use the default model (currently ...)"). Suppressing
+    /// it made the picker contradict itself, so it must travel like any other row.
+    #[test]
+    fn desired_model_from_config_sends_every_row_and_only_drops_absence() {
+        assert_eq!(desired_model_from_config(None), None, "no selection at all");
+        assert_eq!(desired_model_from_config(Some("")), None, "empty");
+        assert_eq!(desired_model_from_config(Some("   ")), None, "whitespace only");
+        // Every catalog row travels in-band verbatim — `default`, aliases, concrete ids.
+        assert_eq!(
+            desired_model_from_config(Some("default")),
+            Some("default".to_string()),
+            "the `default` row is a real pick, NOT a synonym for 'no selection'"
+        );
+        assert_eq!(
+            desired_model_from_config(Some("  default  ")),
+            Some("default".to_string()),
+            "trimmed, not dropped"
+        );
+        assert_eq!(desired_model_from_config(Some("opus")), Some("opus".to_string()));
+        assert_eq!(desired_model_from_config(Some("haiku")), Some("haiku".to_string()));
+        assert_eq!(
+            desired_model_from_config(Some("claude-opus-4-8[1m]")),
+            Some("claude-opus-4-8[1m]".to_string())
+        );
+        assert_eq!(
+            desired_model_from_config(Some(" claude-opus-5[1m] ")),
+            Some("claude-opus-5[1m]".to_string()),
+            "trimmed, not dropped"
+        );
+    }
+
+    /// A selection travels as a `set_model` control_request on the spawn's stdin — the
+    /// replacement for the removed `--model` flag.
+    #[tokio::test]
+    async fn apply_desired_model_writes_set_model_for_a_real_selection() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        *backend.desired_model.lock().unwrap() = Some("haiku".into());
+        backend.apply_desired_model().await;
+
+        // The fake drains stdin into the capture buffer from a spawned task, so poll.
+        let written = poll_captured(&captured, |s| s.contains("set_model")).await;
+        assert!(
+            written.contains("set_model") && written.contains("haiku"),
+            "the selection must reach the wire as set_model, got: {written}"
+        );
+    }
+
+    /// Read the fake's captured stdin until `done` is satisfied (or a short deadline
+    /// passes), returning whatever was captured. The fake drains its stdin duplex from a
+    /// spawned task, so an immediate read races the write.
+    async fn poll_captured(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>, done: impl Fn(&str) -> bool) -> String {
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+            if done(&seen) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        seen
+    }
+
+    /// A session with NO selection writes nothing, so claude resolves the model from the
+    /// user's own config (`ANTHROPIC_MODEL` / account default) like the terminal CLI.
+    #[tokio::test]
+    async fn apply_desired_model_writes_nothing_without_a_selection() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        *backend.desired_model.lock().unwrap() = desired_model_from_config(None);
+        backend.apply_desired_model().await;
+
+        // Absence needs a barrier, not a sleep: write a prompt AFTER the (expected)
+        // no-op and wait for it, so "no set_model" is observed on a wire that has
+        // provably flushed everything apply_desired_model could have written.
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("SENTINEL".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect("Send accepted");
+        let written = poll_captured(&captured, |s| s.contains("SENTINEL")).await;
+        assert!(
+            written.contains("SENTINEL"),
+            "the barrier prompt must reach the wire, got: {written}"
+        );
+        assert!(
+            !written.contains("set_model"),
+            "a session with no selection must not send any model, got: {written}"
+        );
+    }
+
+    /// A mid-session switch must update the slot the WAKE path re-applies from,
+    /// otherwise an idle-reaped session silently reverts to the open-time model (which
+    /// is what the old `--model` flag did: the wake recipe replays the open-time args).
+    #[tokio::test]
+    async fn set_model_dispatch_updates_the_slot_the_wake_reapplies() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+
+        backend
+            .dispatch(Command::SetModel { model: "haiku".into() })
+            .await
+            .expect("SetModel accepted");
+        assert_eq!(
+            backend.desired_model.lock().unwrap().clone(),
+            Some("haiku".to_string()),
+            "a wake must re-apply the user's CURRENT pick"
+        );
+
+        // Switching to the `default` row is a REAL pick (claude runs the account default
+        // for it), so the slot keeps it and a wake re-applies it — clearing the slot here
+        // would silently turn "I want the account default" back into "follow my env".
+        backend
+            .dispatch(Command::SetModel {
+                model: "default".into(),
+            })
+            .await
+            .expect("SetModel(default) accepted");
+        assert_eq!(
+            backend.desired_model.lock().unwrap().clone(),
+            Some("default".to_string()),
+            "the `default` row must be re-applied on wake like any other pick"
+        );
+    }
+
+    /// The initialize catalog carries `resolvedModel` per row — the only bridge between
+    /// our row-id selection and the concrete id `system/init` reports.
+    #[test]
+    fn initialize_response_captures_resolved_models() {
+        let caps = Arc::new(std::sync::Mutex::new(DiscoveredCaps::default()));
+        let (event_tx, _rx) = broadcast::channel(8);
+        // Shape live-captured from claude 2.1.231's initialize reply.
+        let frame = serde_json::json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "ctl-1", "response": { "models": [
+                {"value": "default", "resolvedModel": "claude-opus-4-8[1m]", "displayName": "Default"},
+                {"value": "haiku", "resolvedModel": "claude-haiku-4-5", "displayName": "claude-haiku-4-5"},
+                {"value": "global.anthropic.claude-fable-5", "resolvedModel": "global.anthropic.claude-fable-5", "displayName": "Fable"},
+                {"value": "no-resolved-field", "displayName": "Odd row"}
+            ]}}
+        });
+        sniff_control_initialize(&frame, &caps, &event_tx, "s", 0);
+
+        let resolved = caps.lock().unwrap().resolved_models.clone();
+        assert_eq!(resolved.get("default").map(String::as_str), Some("claude-opus-4-8[1m]"));
+        assert_eq!(resolved.get("haiku").map(String::as_str), Some("claude-haiku-4-5"));
+        assert_eq!(
+            resolved.get("global.anthropic.claude-fable-5").map(String::as_str),
+            Some("global.anthropic.claude-fable-5")
+        );
+        assert!(
+            !resolved.contains_key("no-resolved-field"),
+            "a row without resolvedModel is absent, so the check skips it instead of \
+             reporting a false mismatch"
+        );
+        assert_eq!(
+            caps.lock().unwrap().models.len(),
+            4,
+            "the picker still gets every row, resolvedModel or not"
+        );
+    }
+
+    /// The landed-check compares `system.init.model` against the SELECTED ROW's
+    /// `resolvedModel`, and stays silent whenever it has no ground to stand on.
+    #[test]
+    fn init_model_check_verdicts() {
+        let resolved: std::collections::HashMap<String, String> = [
+            ("default", "claude-opus-4-8[1m]"),
+            ("haiku", "claude-haiku-4-5"),
+            ("opus", "claude-opus-4-8[1m]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let init = |model: &str| serde_json::json!({"type": "system", "subtype": "init", "model": model});
+
+        // Applied: the row id resolves to exactly what claude reports running.
+        assert_eq!(
+            check_init_model(&init("claude-haiku-4-5"), Some("haiku"), &resolved),
+            InitModelCheck::Applied {
+                requested: "haiku".into(),
+                running: "claude-haiku-4-5".into()
+            }
+        );
+        // Mismatch: we asked for haiku, claude is running something else.
+        assert_eq!(
+            check_init_model(&init("claude-opus-5[1m]"), Some("haiku"), &resolved),
+            InitModelCheck::Mismatch {
+                requested: "haiku".into(),
+                expected: "claude-haiku-4-5".into(),
+                running: "claude-opus-5[1m]".into()
+            }
+        );
+        // The `default` row IS checked, because we send it and claude then honours it:
+        // its resolvedModel is the account default and that is what init reports.
+        assert_eq!(
+            check_init_model(&init("claude-opus-4-8[1m]"), Some("default"), &resolved),
+            InitModelCheck::Applied {
+                requested: "default".into(),
+                running: "claude-opus-4-8[1m]".into()
+            }
+        );
+        // NO selection sent: REPORTED but never compared. No row predicts this run — the
+        // `default` row describes what happens when `default` is REQUESTED (it overrides
+        // ANTHROPIC_MODEL), so comparing an unrequested run against it would misfire
+        // (LIVE-PROBED 2.1.231). Reporting it is the ONLY trace of what such a session ran.
+        assert_eq!(
+            check_init_model(&init("claude-opus-5[1m]"), None, &resolved),
+            InitModelCheck::ResolvedByCli {
+                running: "claude-opus-5[1m]".into()
+            },
+            "no set_model sent ⇒ report the running model, do not judge it"
+        );
+        // Catalog not landed yet / row unknown → report without a verdict, never a false
+        // alarm.
+        assert_eq!(
+            check_init_model(&init("whatever"), Some("haiku"), &std::collections::HashMap::new()),
+            InitModelCheck::Unverified {
+                requested: "haiku".into(),
+                running: "whatever".into()
+            }
+        );
+        assert_eq!(
+            check_init_model(&init("whatever"), Some("not-a-row"), &resolved),
+            InitModelCheck::Unverified {
+                requested: "not-a-row".into(),
+                running: "whatever".into()
+            }
+        );
+        // Non-init frames and init frames without a model are ignored.
+        assert_eq!(
+            check_init_model(
+                &serde_json::json!({"type": "system", "subtype": "status", "model": "x"}),
+                Some("haiku"),
+                &resolved
+            ),
+            InitModelCheck::NotChecked
+        );
+        assert_eq!(
+            check_init_model(
+                &serde_json::json!({"type": "system", "subtype": "init"}),
+                Some("haiku"),
+                &resolved
+            ),
+            InitModelCheck::NotChecked
         );
     }
 
@@ -5631,12 +6688,15 @@ mod tests {
         // Running; task_notification{status} → terminal. The reducer upserts these
         // into Running.subagents, which drives has_foreground_activity.
         // `kind` is learned ONLY from task_started.task_type: local_workflow →
-        // WorkflowContainer, local_bash (or any other value) → Other, absent
-        // (progress/notification frames) → None — the pump admits only
-        // WorkflowContainer refs into its Finish-suppression roster.
+        // WorkflowContainer, local_agent → AgentContainer, local_bash (or any
+        // other value) → Other, absent (progress/notification frames) → None —
+        // the pump admits only WorkflowContainer refs into its
+        // Finish-suppression roster; AgentContainer drives the "subagent" card
+        // headline.
         let frames = [
             r#"{"type":"system","subtype":"task_started","task_id":"tk-1","tool_use_id":"toolu-9","subagent_type":"general-purpose","task_type":"local_workflow"}"#,
             r#"{"type":"system","subtype":"task_started","task_id":"tk-2","tool_use_id":"toolu-8","subagent_type":"bash","task_type":"local_bash"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"tk-3","tool_use_id":"toolu-7","subagent_type":"general-purpose","task_type":"local_agent"}"#,
             r#"{"type":"system","subtype":"task_notification","task_id":"tk-1","tool_use_id":"toolu-9","status":"completed"}"#,
         ];
         let bytes = format!("{}\n", frames.join("\n")).into_bytes();
@@ -5655,7 +6715,7 @@ mod tests {
                 } = env.event
                 {
                     updates.push((r#ref, status, parent_ref, label, kind));
-                    if updates.len() == 3 {
+                    if updates.len() == 4 {
                         return;
                     }
                 }
@@ -5665,8 +6725,8 @@ mod tests {
 
         assert_eq!(
             updates.len(),
-            3,
-            "2 task_started + task_notification → 3 SubagentUpdate, got {updates:?}"
+            4,
+            "3 task_started + task_notification → 4 SubagentUpdate, got {updates:?}"
         );
         // started → Running, keyed by task_id, parent = tool_use_id, label = subagent_type.
         assert_eq!(updates[0].0, "tk-1", "ref = task_id");
@@ -5693,24 +6753,35 @@ mod tests {
             Some(crate::event::SubagentTaskKind::Other),
             "task_type=local_bash → Other"
         );
+        // A Task subagent keeps its own kind, so the card layer can label it
+        // "subagent" instead of "bg task".
+        assert_eq!(
+            updates[2].4,
+            Some(crate::event::SubagentTaskKind::AgentContainer),
+            "task_type=local_agent → AgentContainer"
+        );
         // notification completed → Completed, SAME ref (lifecycle upsert); the
         // frame carries no task_type → kind None.
-        assert_eq!(updates[2].0, "tk-1", "same ref across the lifecycle");
+        assert_eq!(updates[3].0, "tk-1", "same ref across the lifecycle");
         assert_eq!(
-            updates[2].1,
+            updates[3].1,
             crate::event::SubagentStatus::Completed,
             "status=completed → Completed"
         );
-        assert_eq!(updates[2].4, None, "task_notification carries no task_type → kind None");
+        assert_eq!(updates[3].4, None, "task_notification carries no task_type → kind None");
     }
 
     /// sniff_mode: claude's AUTHORITATIVE mode signal is `permissionMode` on a
     /// `system/status` frame — emitted for BOTH a user-driven set AND an autonomous
     /// change (plan-exit). The reader adopts it (normal→default) as current_mode AND
-    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10). Wire shape from
-    /// protocols/samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl (autonomous
-    /// plan-exit emitted exactly this system/status). MUTATION-PROVEN by the autonomous
-    /// scenario: without sniff_mode the autonomous mode change is silently dropped.
+    /// emits ConfigChanged{mode} (design §9.10.1 option A; README #10).
+    ///
+    /// This case uses a SYNTHETIC frame because `normal` (claude's internal name for our
+    /// `default`) is the one value the 2.1.227 capture never produced; the real-wire
+    /// counterpart is `sniff_mode_handles_real_capture_status_frames` below.
+    ///
+    /// NOTE: this doc used to cite samples/claude-cli/2.1.187/_all_autonomous_mode.jsonl,
+    /// which no longer exists on disk (only 2.1.221/226/227/228 remain).
     #[tokio::test]
     async fn sniff_mode_emits_config_changed_from_system_status() {
         // `normal` is claude's internal name for our `default` — covers the mapping too.
@@ -5738,6 +6809,64 @@ mod tests {
             backend.capabilities().current_mode.as_deref(),
             Some("default"),
             "the inbound applied mode becomes the authoritative current_mode"
+        );
+    }
+
+    /// The same path, driven by REAL captured bytes rather than a hand-written frame.
+    ///
+    /// Frames copied verbatim from
+    /// samples/claude-cli/2.1.227/set_permission_mode/s5.inbound.jsonl (a
+    /// `set_permission_mode` issued mid-generation; harness:
+    /// scripts/probe-claude-set-permission-mode.py). This matters because the real
+    /// stream interleaves a SECOND kind of `system/status` — `{"status":"requesting"}`
+    /// with NO `permissionMode` at all — which a synthetic single-frame test never
+    /// exercises. Reading such a frame as a mode change would hand the picker a bogus
+    /// value; the guard that prevents it has no other coverage.
+    ///
+    /// Also pins the two facts the capture established: a USER-DRIVEN set really does
+    /// emit `system/status{permissionMode}` (so this confirmation path is live, not
+    /// dead code), and the switch is confirmed while the turn is still streaming.
+    #[tokio::test]
+    async fn sniff_mode_handles_real_capture_status_frames() {
+        // All three `system/status` frames of that capture, in wire order. The trailing
+        // `requesting` one is the load-bearing case: it arrives AFTER the mode was
+        // confirmed, so a reader that mistook it for a mode change would drop the
+        // picker back to nothing.
+        let captured = concat!(
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "a2e3fd0c-bf39-41ac-a01f-716392d7b9b1", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": null, "permissionMode": "acceptEdits", "uuid": "ebf5aac3-1de6-405f-bb23-95cbb75671af", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+            r#"{"type": "system", "subtype": "status", "status": "requesting", "uuid": "3460b839-35bd-45e7-83b7-f79a9637ce57", "session_id": "b1f38ca8-789b-4598-ba55-d96ea7e603d5"}"#,
+            "\n",
+        );
+        let backend =
+            ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(captured.as_bytes().to_vec())))
+                .await;
+        let mut events = backend.events();
+
+        // Collect until the stream goes quiet rather than stopping at the first event:
+        // the point of the trailing frame is that it must produce NO second event, which
+        // an early return could never observe.
+        let mut confirmations: Vec<Option<String>> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::ConfigChanged { mode, .. } = env.event {
+                    confirmations.push(mode);
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            confirmations,
+            vec![Some("acceptEdits".to_string())],
+            "exactly one confirmation, carrying the applied mode: the two `requesting` \
+             frames carry no permissionMode and must be ignored"
+        );
+        assert_eq!(
+            backend.capabilities().current_mode.as_deref(),
+            Some("acceptEdits"),
+            "a later status frame WITHOUT permissionMode must not disturb the applied mode"
         );
     }
 
@@ -5958,7 +7087,9 @@ mod tests {
     #[tokio::test]
     async fn fresh_backend_fires_generate_session_title_once_after_first_success() {
         // A Fresh-open backend fires exactly ONE generate_session_title after
-        // the first successful result; a second success must not re-fire.
+        // the first successful result; a second success must not re-fire while
+        // that request is still awaiting its reply (in-flight dedup — retries
+        // only happen after an empty/error reply or the watchdog timeout).
         let frames = "\
 {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n\
 {\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"again\"}\n";
@@ -5979,6 +7110,113 @@ mod tests {
         // The description carries the first turn's assistant text (live-verified:
         // a bare short prompt makes the CLI's title generation return null).
         assert!(written.contains("Assistant: hi"), "wire: {written:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_title_reply_keeps_latch_and_retries_on_next_success() {
+        // Retry 2026-08-13: an empty-title reply releases the in-flight slot and
+        // keeps the latch armed — the next successful turn fires a SECOND
+        // generate_session_title (new request id). Root cause: production
+        // conversations stuck on placeholder names while a standalone claude
+        // answered the same descriptions 12/12 — losses must be retried.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"one\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"  \"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"two\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-retry-empty", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            2,
+            "empty-title reply must allow a retry on the next success, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn good_title_reply_completes_latch_and_stops_retries() {
+        // A non-empty title completes the latch: later successful turns must
+        // not fire again.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"one\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"Fix login bug\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"two\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-done", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            1,
+            "a good title completes the latch, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_retries_are_capped_at_max_attempts() {
+        // TITLE_MAX_ATTEMPTS bounds total requests: with every reply empty, the
+        // 4th (and later) successful turns must not fire.
+        let frames = format!(
+            "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r1\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}1\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r2\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}2\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r3\"}}\n\
+{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"{TITLE_PREFIX}3\",\"response\":{{\"title\":\"\"}}}}}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r4\"}}\n\
+{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"r5\"}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(frames.into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io_fresh("s-cap", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        assert_eq!(
+            written.matches("generate_session_title").count(),
+            TITLE_MAX_ATTEMPTS as usize,
+            "retries stop at TITLE_MAX_ATTEMPTS, wire: {written:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_inflight_guards_by_request_id() {
+        // The reply/watchdog race resolves through clear_inflight: only the
+        // request id that is actually in flight clears the slot; a completed
+        // latch (`on_reply(true)`) also clears `pending`.
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = ClaudeSessionBackend::build_with_io_fresh("s-guard", Box::new(fake)).await;
+        let tg = &backend.title_gen;
+
+        *tg.inflight.lock().unwrap() = Some(format!("{TITLE_PREFIX}7"));
+        assert!(
+            !tg.clear_inflight(&format!("{TITLE_PREFIX}6")),
+            "wrong id must not clear"
+        );
+        assert!(tg.clear_inflight(&format!("{TITLE_PREFIX}7")), "matching id clears");
+        assert!(
+            !tg.clear_inflight(&format!("{TITLE_PREFIX}7")),
+            "second clear is a no-op"
+        );
+
+        assert!(
+            tg.pending.load(std::sync::atomic::Ordering::SeqCst),
+            "fresh backend arms the latch"
+        );
+        *tg.inflight.lock().unwrap() = Some(format!("{TITLE_PREFIX}8"));
+        tg.on_reply(&format!("{TITLE_PREFIX}8"), true);
+        assert!(tg.inflight.lock().unwrap().is_none());
+        assert!(
+            !tg.pending.load(std::sync::atomic::Ordering::SeqCst),
+            "a usable title completes the latch"
+        );
     }
 
     #[tokio::test]

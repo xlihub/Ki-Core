@@ -4,6 +4,20 @@ This changelog records Ki-Core product releases. Runtime changes inherited from
 AionCore remain in [CHANGELOG.md](CHANGELOG.md) and are linked through the
 version mapping in [ki-core-versions.json](ki-core-versions.json).
 
+## [0.1.3](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.2...ki-core-v0.1.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* **cli:** register unindexed top-level subcommands in the capability index ([#929](https://github.com/xlihub/Ki-Core/issues/929)) ([c490161](https://github.com/xlihub/Ki-Core/commit/c490161df4ee7ab34830e81a67473d416ca78f03))
+* **upstream:** sync AionCore v0.1.72 ([a319bb6](https://github.com/xlihub/Ki-Core/commit/a319bb694b8f6226a911d5481ead9ca71f964d0f))
+* **upstream:** sync AionCore v0.1.72 ([7dc728c](https://github.com/xlihub/Ki-Core/commit/7dc728c9479cd9b9022b14a89c5597d61e8957c5))
+
+
+### Performance Improvements
+
+* slim auto-inject skill descriptions to the injection budget ([#930](https://github.com/xlihub/Ki-Core/issues/930)) ([9b7e4ce](https://github.com/xlihub/Ki-Core/commit/9b7e4cee9c14faabb4965bc364e3a093c1813e61))
+
 ## [0.1.2](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.1...ki-core-v0.1.2) (2026-08-24)
 
 

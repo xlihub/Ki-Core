@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    BackendError, Command, CommandMeta, ContentBlock, SessionBackend, SessionEnvelope, SessionEvent, ToolResultContent,
+    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
+    SessionEvent, ToolResultContent,
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
@@ -31,7 +32,7 @@ use crate::protocol::events::{
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
 use crate::types::{PromptMediaCaps, SendMessageData};
-use aionui_api_types::AcpBuildExtra;
+use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
@@ -78,6 +79,11 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
     last_activity_ms: AtomicI64,
+    /// Live (declared, not yet terminal) background containers — the pump's
+    /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
+    /// that background work outlives the turn (status=Finished + no frames
+    /// otherwise reads as idle and gets the agent killed mid-flight).
+    live_background_tasks: std::sync::atomic::AtomicUsize,
     /// Coarse status derived from the FSM edge the translator observes.
     status: std::sync::Mutex<Option<ConversationStatus>>,
     /// The CLI-assigned backend session id, learned from `BackendBound`. The ACP
@@ -103,11 +109,44 @@ struct SessionRuntime {
     /// (`get_config_options`) prefers this over the (synchronously-seeded) caps value so
     /// the observed re-read confirms the switch. `None` until the user picks a level.
     effort_override: std::sync::Mutex<Option<String>>,
+    /// Raw material from the last `CatalogUpdated`, kept so a later `ConfigChanged`
+    /// can re-project the WHOLE options snapshot.
+    ///
+    /// Needed because the two constraints collide: the frontend REPLACES its whole
+    /// snapshot on every `acp_config_option` frame (`useAcpConfigOptions` ->
+    /// `replaceSnapshot`), so a confirmation frame must carry every category or it
+    /// wipes the sibling pickers — yet the pump deliberately holds no backend Arc
+    /// (see `spawn_event_pump`) and therefore cannot rebuild the catalog itself.
+    /// Empty until the first catalog lands; a confirmation arriving before that
+    /// degrades to "update the override, emit nothing" (REST re-read still corrects).
+    last_catalog: std::sync::Mutex<Option<(Vec<ModeInfo>, Vec<ModelInfo>)>>,
+    /// Last per-axis values the BACKEND reported (`capabilities().current_*`), as opposed
+    /// to values the user picked (the `*_override` fields above).
+    ///
+    /// The pump needs these because a pushed frame REPLACES the frontend's whole
+    /// snapshot, so every axis it re-sends overwrites the picker — including axes the
+    /// user never touched, whose override is `None`. Without this the effort level went
+    /// blank on every mode confirmation. Filled by `get_config_options`, which is the one
+    /// place holding both the backend handle and the same fallback order.
+    /// Order is `override → this`, identical to REST.
+    caps_fallback: std::sync::Mutex<CapsFallback>,
+}
+
+/// Backend-reported current values, mirrored out of `capabilities()` so the
+/// backend-Arc-free event pump can apply the same fallback REST applies.
+#[derive(Debug, Clone, Default)]
+struct CapsFallback {
+    mode: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 impl SessionRuntime {
     fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    fn set_live_background_tasks(&self, count: usize) {
+        self.live_background_tasks.store(count, Ordering::Relaxed);
     }
     fn set_status(&self, s: ConversationStatus) {
         if let Ok(mut g) = self.status.lock() {
@@ -145,6 +184,22 @@ impl SessionRuntime {
     }
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
+    }
+    fn set_last_catalog(&self, modes: Vec<ModeInfo>, models: Vec<ModelInfo>) {
+        if let Ok(mut g) = self.last_catalog.lock() {
+            *g = Some((modes, models));
+        }
+    }
+    fn last_catalog(&self) -> Option<(Vec<ModeInfo>, Vec<ModelInfo>)> {
+        self.last_catalog.lock().ok().and_then(|g| g.clone())
+    }
+    fn set_caps_fallback(&self, fallback: CapsFallback) {
+        if let Ok(mut g) = self.caps_fallback.lock() {
+            *g = fallback;
+        }
+    }
+    fn caps_fallback(&self) -> CapsFallback {
+        self.caps_fallback.lock().ok().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Atomic clean-converge frame: if not already `Finished`, set status ←
@@ -431,11 +486,14 @@ impl SessionAgentTask {
         let runtime = Arc::new(SessionRuntime {
             tx,
             last_activity_ms: AtomicI64::new(now_ms()),
+            live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
             effort_override: std::sync::Mutex::new(None),
+            last_catalog: std::sync::Mutex::new(None),
+            caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
         });
         // Subscribe to the backend's event stream HERE (sync), then hand ONLY the
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
@@ -465,6 +523,119 @@ impl SessionAgentTask {
 
     fn next_command_id(&self) -> u64 {
         self.command_seq.fetch_add(1, Ordering::Relaxed) as u64
+    }
+
+    /// Build the multimodal `ContentBlock` vector for a prompt: partition
+    /// attachments by the backend's declared prompt blocks — capable media
+    /// becomes native Image/Audio blocks; everything else keeps the
+    /// pre-multimodal form (path in the [[AION_FILES]] text + resource link).
+    ///
+    /// A native media block carries ONLY bytes: `ContentBlock::Image` is
+    /// `{data, media_type}` with no path field, and `partition_media` has
+    /// already stripped that path out of the [[AION_FILES]] text. So each
+    /// natively-delivered attachment is PAIRED with a resource link to the very
+    /// same file — the adapters render a link as an `[Attached file: <uri>]`
+    /// text element (see `adapter/claude.rs` / `backend/codex_conn.rs`), which
+    /// is how every non-media attachment already travels and how images
+    /// travelled before the multimodal split. Without the pair, an agent that
+    /// can both see and read files gets pixels it cannot open (Sentry
+    /// 7677917218). The pair is gated on the backend advertising `resource`:
+    /// an un-advertised block is rejected at dispatch and would kill the whole
+    /// Send (`BlockSet::allows`).
+    ///
+    /// A read failure degrades that attachment back to a resource link alone —
+    /// the path also remains in the original text because partition already ran,
+    /// which the adapters tolerate (they resolve links independently of the
+    /// text). Shared by `send_message` and `deliver_midturn`.
+    async fn build_prompt_blocks(&self, data: &SendMessageData) -> Vec<ContentBlock> {
+        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
+        let link_media_paths = self.backend.capabilities().prompt_blocks.resource;
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !partition.content.is_empty() {
+            content.push(ContentBlock::Text(partition.content));
+        }
+        for path in partition.path_files {
+            // File paths ride as resource links; the claude/codex adapters resolve
+            // them (Read tool / base64) at dispatch time.
+            content.push(ContentBlock::ResourceLink {
+                uri: path,
+                mime_type: None,
+            });
+        }
+        let mut media_links = 0usize;
+        for attachment in &partition.media {
+            match crate::media::read_media_bytes(attachment).await {
+                Some(bytes) => {
+                    content.push(match attachment.kind {
+                        crate::media::MediaKind::Image => ContentBlock::Image {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                        crate::media::MediaKind::Audio => ContentBlock::Audio {
+                            data: bytes,
+                            media_type: attachment.mime.clone(),
+                        },
+                    });
+                    // Pair the bytes with the path (see the fn doc): the block
+                    // itself has no uri field and the text no longer lists it.
+                    if link_media_paths {
+                        content.push(ContentBlock::ResourceLink {
+                            uri: attachment.path.clone(),
+                            mime_type: Some(attachment.mime.clone()),
+                        });
+                        media_links += 1;
+                    }
+                }
+                None => content.push(ContentBlock::ResourceLink {
+                    uri: attachment.path.clone(),
+                    mime_type: Some(attachment.mime.clone()),
+                }),
+            }
+        }
+        if !partition.media.is_empty() {
+            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
+                ContentBlock::Image { .. } => (i + 1, a),
+                ContentBlock::Audio { .. } => (i, a + 1),
+                _ => (i, a),
+            });
+            tracing::info!(
+                conversation_id = %self.conversation_id,
+                msg_id = %data.msg_id,
+                images,
+                audios,
+                media_links,
+                "session prompt carries native media content blocks"
+            );
+        }
+        content
+    }
+
+    /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
+    /// opening a new one. Dispatches `Command::Steer` (codex `turn/steer`;
+    /// claude direct stdin user-frame write) with `data.msg_id` as the
+    /// correlation id both CLIs round-trip (claude user-frame `uuid` echoed via
+    /// `command_lifecycle`; codex `clientUserMessageId`).
+    ///
+    /// Deliberately NOT `send_message`: no `AgentStreamEvent::Start` emit and
+    /// no status flip — the message folds into the ACTIVE turn, whose relay and
+    /// status are already live (a stray Start would open a phantom turn
+    /// boundary mid-stream).
+    pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.runtime.touch();
+        let content = self.build_prompt_blocks(&data).await;
+        self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
+        let cmd = Command::Steer {
+            content,
+            client_msg_id: Some(data.msg_id),
+        };
+        self.backend
+            .dispatch(cmd)
+            .await
+            .map(|_| ())
+            // Preserve the backend's message text: the conversation layer
+            // classifies codex's "no active turn to steer" rejection to fall
+            // back to the normal new-turn path.
+            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
     }
 
     /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
@@ -539,7 +710,14 @@ impl SessionAgentTask {
             .map(|p| {
                 let is_ask = p.tool_name == "AskUserQuestion";
                 let options = if is_ask {
-                    ask_user_question_options(p.questions.as_ref())
+                    // `p.questions` is the bare `questions[]` ARRAY, but the
+                    // projector expects the whole tool input and does its own
+                    // `.get("questions")` — passing the array straight through
+                    // made recovery silently degrade to the generic
+                    // Allow/AllowAlways/Reject card (live e2e catch, 2026-08-04).
+                    // Re-wrap to the input shape the live path uses.
+                    let input = p.questions.as_ref().map(|qs| serde_json::json!({ "questions": qs }));
+                    ask_user_question_options(input.as_ref())
                 } else {
                     Vec::new()
                 };
@@ -555,6 +733,10 @@ impl SessionAgentTask {
                     action: None,
                     description: String::new(),
                     command_type: None,
+                    // The full question payload rides along so the frontend
+                    // recovery rebuilds the REAL question card; the flattened
+                    // options above stay as the fallback for older frontends.
+                    questions: if is_ask { p.questions.clone() } else { None },
                     options: options
                         .into_iter()
                         .map(|o| aionui_common::ConfirmationOption {
@@ -578,6 +760,54 @@ impl SessionAgentTask {
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
     ///     claude_conn `build_control_response`; single-select single-question path).
     ///
+    /// Answer a structured question card (AskUserQuestion) — the DEDICATED
+    /// typed channel (2026-08-05 ruling: question answers do not ride the
+    /// permission confirm endpoint). `answers: None` = the user dismissed the
+    /// card; the claude adapter maps that to a deny (an allow with no answers
+    /// is silent data loss — claude drops unanswered questions, live 2.1.178).
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        // api-types is the conversation layer's currency; convert to the
+        // session command's own type at this boundary.
+        let answers = answers.map(|list| {
+            list.into_iter()
+                .map(|a| aionui_session::QuestionAnswer {
+                    question: a.question,
+                    labels: a.labels,
+                })
+                .collect::<Vec<_>>()
+        });
+        let backend = self.backend.clone();
+        let request_id = request_id.to_string();
+        let conv_id = self.conversation_id.clone();
+        // Same fire-and-forget shape as confirm(): the REST reply has already
+        // returned by the time the dispatch runs, so a failure here MUST be
+        // surfaced in the log or a wedged ask is undiagnosable in production.
+        tokio::spawn(async move {
+            let command = aionui_session::Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers,
+            };
+            match backend.dispatch(command).await {
+                Ok(_) => tracing::info!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    "ask answer delivered to backend (dedicated channel)"
+                ),
+                Err(e) => tracing::error!(
+                    conv_id = %conv_id,
+                    request_id = %request_id,
+                    error = %e,
+                    "ask answer FAILED after REST reply already returned success — claude stays blocked on can_use_tool"
+                ),
+            }
+        });
+        Ok(())
+    }
+
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -721,6 +951,13 @@ impl SessionAgentTask {
         })
     }
 
+    /// The session runtime, for tests that need to drive the pump's projection directly
+    /// (the pump is spawned internally and holds the only other handle).
+    #[cfg(test)]
+    fn runtime_for_test(&self) -> &SessionRuntime {
+        &self.runtime
+    }
+
     /// Config-options (mode + model selects). For each select the optimistic override
     /// (last set_config_option) wins over the capabilities snapshot's current_value —
     /// this is what makes set_config_option's observed re-read succeed (the snapshot
@@ -732,6 +969,25 @@ impl SessionAgentTask {
         // The effort catalog depends on the EFFECTIVE current model (override wins over the
         // snapshot's current_model), resolved before the model option consumes it below.
         let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
+        // Mirror what the BACKEND reports into the runtime so the event pump can apply the
+        // same `override → caps` fallback when it re-projects this snapshot. The pump holds
+        // no backend Arc and would otherwise send `None` for every axis the user never
+        // picked — and since the frontend REPLACES its whole snapshot on that frame, those
+        // pickers would go blank (this is the one path that sees both sides).
+        self.runtime.set_caps_fallback(CapsFallback {
+            mode: current_mode.clone(),
+            model: current_model.clone(),
+            effort: self.backend.capabilities().current_effort,
+        });
+        // Same reason, for the catalog itself: a later confirmation has to re-project the
+        // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
+        // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
+        // static), so gating on it left agy's picker stuck on "switching…" with no signal
+        // that could ever clear it. This path always runs first: the frontend reads
+        // config-options on mount, before any switch is possible.
+        if !modes.is_empty() || !models.is_empty() {
+            self.runtime.set_last_catalog(modes.clone(), models.clone());
+        }
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -862,6 +1118,14 @@ impl SessionAgentTask {
             .dispatch(cmd)
             .await
             .map_err(|e| AgentError::bad_request(e.to_string()))?;
+        // Where does this switch actually land? Asked of the LIVE backend rather than
+        // assumed, because the answer moves: claude queues a control frame raised
+        // mid-turn but writes an idle one straight out, so the same backend answers
+        // differently second to second. Read right after dispatch, the closest we can get
+        // to the instant the backend decided (the alternative, threading the verdict back
+        // through `CommandReceipt`, would touch ~58 construction sites for one bit).
+        let deferred = option_id == "mode"
+            && self.backend.capabilities().mode_switch_effect == aionui_session::ModeSwitchEffect::NextTurn;
         // Cache the requested value as an optimistic override for mode/model, then
         // re-read the config-options snapshot so the response satisfies the frontend's
         // `hasObservedValue` contract (confirmation == Observed AND the option's
@@ -876,7 +1140,17 @@ impl SessionAgentTask {
         // observed re-read — the frontend's `hasObservedValue` requires Observed AND the
         // option's current_value == requested, same as mode/model.
         match option_id {
-            "mode" => self.runtime.set_mode_override(value.to_string()),
+            // Adopt the value as the picker highlight ONLY when it is really in force.
+            // Writing the override for a deferred switch is exactly what made the old
+            // response self-fulfilling — it read straight back and reported Observed
+            // while the agent still enforced the previous mode. Left unwritten, the
+            // snapshot keeps reporting the mode actually governing tool approvals, and
+            // the event pump adopts the new one when the agent confirms it.
+            "mode" => {
+                if !deferred {
+                    self.runtime.set_mode_override(value.to_string());
+                }
+            }
             "model" => self.runtime.set_model_override(value.to_string()),
             "effort" | "reasoning_effort" | "thought_level" => {
                 // Optimistic highlight: claude emits no effort echo, so the streaming
@@ -915,7 +1189,12 @@ impl SessionAgentTask {
             .and_then(|o| o.current_value.as_deref())
             == Some(value);
         Ok(aionui_api_types::SetConfigOptionResponse {
-            confirmation: if observed {
+            // `deferred` first: a deferred switch deliberately leaves `current_value` on
+            // the old mode, so `observed` is false for the honest reason and must not be
+            // downgraded to the ambiguous `CommandAck`.
+            confirmation: if deferred {
+                aionui_api_types::ConfigOptionConfirmation::PendingNextTurn
+            } else if observed {
                 aionui_api_types::ConfigOptionConfirmation::Observed
             } else {
                 aionui_api_types::ConfigOptionConfirmation::CommandAck
@@ -1030,8 +1309,16 @@ impl IAgentTask for SessionAgentTask {
         self.runtime.last_activity_ms.load(Ordering::Relaxed)
     }
 
+    fn live_background_tasks(&self) -> usize {
+        self.runtime.live_background_tasks.load(Ordering::Relaxed)
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.tx.subscribe()
+    }
+
+    fn supports_midturn_delivery(&self) -> bool {
+        self.backend.capabilities().supports_midturn_delivery
     }
 
     fn prompt_media_caps(&self) -> PromptMediaCaps {
@@ -1044,58 +1331,7 @@ impl IAgentTask for SessionAgentTask {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.touch();
-        // Partition attachments by the backend's declared prompt blocks:
-        // capable media becomes native Image/Audio blocks; everything else
-        // keeps the pre-multimodal form (path in the [[AION_FILES]] text +
-        // resource link). A read failure degrades that attachment back to a
-        // resource link — the path also remains in the original text because
-        // partition already ran, which the adapters tolerate (they resolve
-        // links independently of the text).
-        let partition = crate::media::partition_media(&data.content, &data.files, self.prompt_media_caps());
-        let mut content: Vec<ContentBlock> = Vec::new();
-        if !partition.content.is_empty() {
-            content.push(ContentBlock::Text(partition.content));
-        }
-        for path in partition.path_files {
-            // File paths ride as resource links; the claude/codex adapters resolve
-            // them (Read tool / base64) at dispatch time.
-            content.push(ContentBlock::ResourceLink {
-                uri: path,
-                mime_type: None,
-            });
-        }
-        for attachment in &partition.media {
-            match crate::media::read_media_bytes(attachment).await {
-                Some(bytes) => content.push(match attachment.kind {
-                    crate::media::MediaKind::Image => ContentBlock::Image {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                    crate::media::MediaKind::Audio => ContentBlock::Audio {
-                        data: bytes,
-                        media_type: attachment.mime.clone(),
-                    },
-                }),
-                None => content.push(ContentBlock::ResourceLink {
-                    uri: attachment.path.clone(),
-                    mime_type: Some(attachment.mime.clone()),
-                }),
-            }
-        }
-        if !partition.media.is_empty() {
-            let (images, audios) = content.iter().fold((0usize, 0usize), |(i, a), b| match b {
-                ContentBlock::Image { .. } => (i + 1, a),
-                ContentBlock::Audio { .. } => (i, a + 1),
-                _ => (i, a),
-            });
-            tracing::info!(
-                conversation_id = %self.conversation_id,
-                msg_id = %data.msg_id,
-                images,
-                audios,
-                "session prompt carries native media content blocks"
-            );
-        }
+        let content = self.build_prompt_blocks(&data).await;
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
         self.dump_session_cli_final_input(&content, Some(data.msg_id.as_str()));
@@ -1177,10 +1413,14 @@ impl IAgentTask for SessionAgentTask {
         // turn (gate recovers in seconds, no crash card), then (2) delegate real
         // process teardown to the backend, which kills the process tree WITHOUT
         // waiting for the last Arc to drop.
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill(UserCancelTimeout): emitted clean Finish + delegating backend terminate (was Drop-only no-op)"
+                ?reason,
+                "session kill: emitted clean Finish and delegated backend termination"
             );
             // 1) clean converge FIRST: relay breaks → orchestrator releases the turn
             //    claim → `cancelling` cleared → gate recovers (no red crash card).
@@ -1216,10 +1456,14 @@ impl SessionAgentTask {
         &self,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(
+            reason,
+            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+        ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
-                "session kill_and_wait(UserCancelTimeout): emitted clean Finish + awaiting backend terminate"
+                ?reason,
+                "session kill_and_wait: emitted clean Finish and awaiting backend termination"
             );
             self.runtime.emit_finish_once(); // clean converge FIRST (sync)
             let backend = self.backend.clone();
@@ -1407,11 +1651,58 @@ fn spec_mode_model(
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
     let mode = resolved_session_mode(config, session_snapshot, metadata);
-    let model = session_snapshot
-        .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.current_model_id.clone())
-        .filter(|s| !s.is_empty());
+    // Same drop-if-not-in-catalog discipline the mode path applies: a persisted
+    // selection outlives the catalog it came from, and no backend validates a model id
+    // at spawn — claude in particular ACCEPTS a bogus id and only fails once the user
+    // sends a message (LIVE-PROBED 2.1.231: both `--model <bogus>` and
+    // `set_model{<bogus>}` echo the id into `system.init.model`, then the turn dies with
+    // `result{is_error:true}`). Dropping it here turns that into a silent fall back to
+    // the agent's default, which is the difference between "my old pick quietly stopped
+    // applying" and "every message errors".
+    let model = clear_stale_model(
+        metadata,
+        session_snapshot
+            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
+            .or_else(|| config.current_model_id.clone())
+            .filter(|s| !s.is_empty()),
+        conversation_id,
+    );
     (spec, mode, model)
+}
+
+/// Drop a model selection the agent's advertised catalog does not contain.
+///
+/// Pass-through when the catalog is absent or empty — that is the first-ever open of an
+/// agent (nothing handshaked yet), NOT evidence that the selection is invalid. Only a
+/// non-empty catalog that lacks the id is proof, and the id can legitimately go stale:
+/// the concrete rows depend on the user's `ANTHROPIC_DEFAULT_*` / provider env and on
+/// the CLI version, so an id stored months ago may simply no longer exist.
+fn clear_stale_model(
+    metadata: &aionui_api_types::AgentMetadata,
+    model: Option<String>,
+    conversation_id: &str,
+) -> Option<String> {
+    use crate::manager::acp::config_option_catalog::extract_models_from_value;
+    let model = model?;
+    let Some(catalog) = metadata
+        .handshake
+        .available_models
+        .as_ref()
+        .and_then(extract_models_from_value)
+    else {
+        return Some(model);
+    };
+    if catalog.available_models.is_empty() || catalog.available_models.iter().any(|entry| entry.model_id == model) {
+        return Some(model);
+    }
+    tracing::warn!(
+        conversation_id,
+        agent_id = %metadata.id,
+        requested_model = %model,
+        "persisted model selection is absent from the agent's catalog — falling back to \
+         the agent default for this session"
+    );
+    None
 }
 
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
@@ -1573,7 +1864,9 @@ pub async fn build_session_instance(
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
-    // prepend the team coordination MCP. Same order as the app boundary.
+    // prepend the team coordination MCP. Same order as the app boundary. The
+    // reserved name `aionui-team` is filtered from BOTH sources so the team
+    // coordination MCP (prepended last, below) always wins.
     let mut neutral = match mcp_server_repo {
         Some(repo) => {
             crate::mcp_resolve::resolve_session_mcp_servers(
@@ -1587,7 +1880,14 @@ pub async fn build_session_instance(
         }
         None => Vec::new(),
     };
-    neutral.extend(config.session_mcp_servers.iter().cloned());
+    neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
+    neutral.extend(
+        config
+            .session_mcp_servers
+            .iter()
+            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+            .cloned(),
+    );
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
@@ -1832,7 +2132,13 @@ fn resolve_session_cli_program(
         });
     }
 
-    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
+    // PATH only. claude/codex used to prefer a bundled, version-pinned copy,
+    // which silently diverged from whatever the user had installed: the same
+    // prompt behaved differently in AionUi and in the user's terminal, with
+    // nothing on screen explaining why. They are now treated exactly like agy —
+    // the user's own install is the one that runs, and a drift from the version
+    // this integration was verified against is reported rather than hidden.
+    aionui_runtime::resolve_command_path(backend_label)
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -2223,6 +2529,8 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
         SessionEvent::Detached { .. } => "Detached",
         SessionEvent::Permission { .. } => "Permission",
         SessionEvent::PermissionResolved { .. } => "PermissionResolved",
+        SessionEvent::Ask { .. } => "Ask",
+        SessionEvent::AskResolved { .. } => "AskResolved",
         SessionEvent::UsageDelta { .. } => "UsageDelta",
         SessionEvent::ConfigChanged { .. } => "ConfigChanged",
         SessionEvent::BackendBound { .. } => "BackendBound",
@@ -2248,6 +2556,99 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
 }
 
 /// Drain the backend's `events()` and re-broadcast each as an `AgentStreamEvent`.
+/// Project the direct-CLI catalog into a WHOLE `acp_config_option` snapshot and
+/// broadcast it.
+///
+/// Emitted whole (mode + model + effort together) because the frontend REPLACES its
+/// entire snapshot on this frame (`useAcpConfigOptions` -> `replaceSnapshot`) — a
+/// partial frame would wipe the sibling pickers. Built here rather than in the
+/// stateless `translate_event` because every current-value highlight comes from the
+/// runtime's overrides.
+///
+/// Two callers, deliberately sharing one projection: the catalog arrival itself, and a
+/// later `ConfigChanged` confirming an agent-applied mode/model.
+fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtime: &SessionRuntime) {
+    // Same fallback order REST uses (`override → backend-reported`). Without the second
+    // half, every axis the user never picked would go out as `None` and blank that picker,
+    // because the frontend replaces its whole snapshot on this frame.
+    let fallback = runtime.caps_fallback();
+    let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
+    if !modes.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "mode".into(),
+            name: Some("Mode".into()),
+            label: None,
+            description: None,
+            category: Some("mode".into()),
+            option_type: "select".into(),
+            current_value: runtime.mode_override().or_else(|| fallback.mode.clone()),
+            options: modes
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    if !models.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "model".into(),
+            name: Some("Model".into()),
+            label: None,
+            description: None,
+            category: Some("model".into()),
+            option_type: "select".into(),
+            current_value: runtime.model_override().or_else(|| fallback.model.clone()),
+            options: models
+                .iter()
+                .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: m.id.clone(),
+                    name: Some(m.name.clone()),
+                    label: None,
+                    description: m.description.clone(),
+                })
+                .collect(),
+        });
+    }
+    // Reasoning-effort axis (claude per-model `supportedEffortLevels`). Re-emitted here
+    // too — otherwise a push would wipe the effort option that `get_config_options`
+    // (REST) surfaced. The pump has no backend Arc, so the current model is resolved
+    // from the pushed catalog and the highlight comes from the runtime's optimistic
+    // effort override (claude emits no effort echo). Emitted only when the current model
+    // advertises efforts (union fallback when the current model is unknown).
+    let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
+    if !efforts.is_empty() {
+        config_options.push(aionui_api_types::AcpConfigOptionDto {
+            id: "reasoning_effort".into(),
+            name: Some("Thinking".into()),
+            label: None,
+            description: None,
+            category: Some("thought_level".into()),
+            option_type: "select".into(),
+            current_value: runtime.effort_override().or_else(|| fallback.effort.clone()),
+            options: efforts
+                .iter()
+                .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
+                    value: e.clone(),
+                    name: Some(e.clone()),
+                    label: None,
+                    description: None,
+                })
+                .collect(),
+        });
+    }
+    // No categories → nothing to re-project; a spurious empty-snapshot frame would only
+    // clobber the frontend's picker.
+    if !config_options.is_empty()
+        && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
+    {
+        let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+    }
+}
+
 fn spawn_event_pump(
     mut events: BoxStream<'static, SessionEnvelope>,
     runtime: Arc<SessionRuntime>,
@@ -2454,7 +2855,8 @@ fn spawn_event_pump(
                     | SessionEvent::ThoughtDelta { .. }
                     | SessionEvent::ToolCall { .. }
                     | SessionEvent::ToolResult { .. }
-                    | SessionEvent::Permission { .. } => {
+                    | SessionEvent::Permission { .. }
+                    | SessionEvent::Ask { .. } => {
                         tracing::info!(
                             conv_id = %conversation_id,
                             event = session_event_name(&env.event),
@@ -2491,6 +2893,7 @@ fn spawn_event_pump(
                     input: None,
                     output: Some(acc.clone()),
                     description: None,
+                    parent_call_id: None,
                 }));
                 continue;
             }
@@ -2511,83 +2914,10 @@ fn spawn_event_pump(
                 slash_commands,
             } = &env.event
             {
-                let mut config_options: Vec<aionui_api_types::AcpConfigOptionDto> = Vec::new();
-                if !modes.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "mode".into(),
-                        name: Some("Mode".into()),
-                        label: None,
-                        description: None,
-                        category: Some("mode".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.mode_override(),
-                        options: modes
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                if !models.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "model".into(),
-                        name: Some("Model".into()),
-                        label: None,
-                        description: None,
-                        category: Some("model".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.model_override(),
-                        options: models
-                            .iter()
-                            .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: m.id.clone(),
-                                name: Some(m.name.clone()),
-                                label: None,
-                                description: m.description.clone(),
-                            })
-                            .collect(),
-                    });
-                }
-                // Reasoning-effort axis (claude per-model `supportedEffortLevels`). The
-                // frontend REPLACES its whole config-options snapshot on this frame, so we
-                // MUST re-emit effort here too — otherwise a late catalog push would wipe
-                // the effort option that `get_config_options` (REST) surfaced. The pump has
-                // no backend Arc, so the current model is resolved from the pushed catalog
-                // and the highlight comes from the runtime's optimistic effort override
-                // (claude emits no effort echo). Emitted only when the current model
-                // advertises efforts (union fallback when the current model is unknown).
-                let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
-                if !efforts.is_empty() {
-                    config_options.push(aionui_api_types::AcpConfigOptionDto {
-                        id: "reasoning_effort".into(),
-                        name: Some("Thinking".into()),
-                        label: None,
-                        description: None,
-                        category: Some("thought_level".into()),
-                        option_type: "select".into(),
-                        current_value: runtime.effort_override(),
-                        options: efforts
-                            .iter()
-                            .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
-                                value: e.clone(),
-                                name: Some(e.clone()),
-                                label: None,
-                                description: None,
-                            })
-                            .collect(),
-                    });
-                }
-                // No categories (both lists empty) → nothing to re-project; a spurious
-                // empty-snapshot frame would only clobber the frontend's picker.
-                if !config_options.is_empty()
-                    && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
-                {
-                    let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
-                }
+                // Retain the raw catalog so a later `ConfigChanged` can re-project the
+                // WHOLE snapshot (the pump cannot rebuild it — it holds no backend Arc).
+                runtime.set_last_catalog(modes.clone(), models.clone());
+                emit_config_options_snapshot(modes, models, &runtime);
                 // Slash-command catalog. claude advertises its command list in the
                 // async `initialize` response — the same late-catalog timing that
                 // strands the model/mode picker — and the frontend's mount-time REST
@@ -2615,6 +2945,32 @@ fn spawn_event_pump(
                 continue;
             }
 
+            // An agent-CONFIRMED mode/model switch: claude's `system/status{permissionMode}`
+            // (verified: samples/claude-cli/2.1.227/set_permission_mode/) or codex's
+            // `thread/settings/updated`. This is the only honest "it actually took effect"
+            // signal — unlike the optimistic override `set_config_option` writes at REQUEST
+            // time, which reads straight back and so always reports success. Adopt the
+            // confirmed value as the authoritative highlight and re-project the whole
+            // snapshot, so the picker stops showing a mode the agent has not applied (codex
+            // applies a settings update only from the NEXT turn; verified:
+            // samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json).
+            //
+            // Deliberately NO `continue`: the event must still reach `persist_side_effects`
+            // below, which is what writes `current_mode_id` for the next respawn/resume.
+            if let SessionEvent::ConfigChanged { mode, model } = &env.event {
+                if let Some(mode) = mode {
+                    runtime.set_mode_override(mode.clone());
+                }
+                if let Some(model) = model {
+                    runtime.set_model_override(model.clone());
+                }
+                // Nothing to re-project until a catalog has landed. The override is still
+                // updated, so the next REST read reports the confirmed value.
+                if let Some((modes, models)) = runtime.last_catalog() {
+                    emit_config_options_snapshot(&modes, &models, &runtime);
+                }
+            }
+
             // Project a running workflow's roster to the UI. Everything a workflow
             // does after launch arrives ONLY as these task frames, so without this
             // the conversation shows nothing at all for the whole flight.
@@ -2631,6 +2987,7 @@ fn spawn_event_pump(
                 // turns (forward + persist), so no pump-side broadcast bypass.
                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
             }
+            runtime.set_live_background_tasks(workflow_cards.len());
 
             // Track in-flight workflow/subagent refs so a non-blocking Workflow's
             // intermediate `result` frame does not prematurely terminate the turn.
@@ -2732,6 +3089,7 @@ fn spawn_event_pump(
                             ) {
                                 let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                             }
+                            runtime.set_live_background_tasks(workflow_cards.len());
                             // Same per-turn closure the real terminal arm performs:
                             // close every tool call left open as Canceled BEFORE the
                             // Finish (the relay stops forwarding the turn at Finish).
@@ -2744,6 +3102,7 @@ fn spawn_event_pump(
                                     input: None,
                                     output: None,
                                     description: None,
+                                    parent_call_id: None,
                                 }));
                             }
                             tool_output.clear();
@@ -2838,7 +3197,30 @@ fn spawn_event_pump(
                     ) {
                         let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
                     }
+                    runtime.set_live_background_tasks(workflow_cards.len());
+                    // Calls deliberately left running past this turn end (see below);
+                    // re-registered after the drain so their late frames still resolve.
+                    let mut kept_open: Vec<(String, String)> = Vec::new();
                     for (call_id, name) in open_tools.drain() {
+                        // codex's unified exec starts the command in a background PTY
+                        // and lets the model END ITS TURN while the process runs; the
+                        // completion item arrives later (verified live 0.145.0: every
+                        // commandExecution item carries `source: "unifiedExecStartup"`).
+                        // Cancelling such a card on a CLEAN turn end is a lie — the
+                        // command is still running and its own terminal will settle the
+                        // card — and it is exactly what users read as "the AI stopped by
+                        // itself". Same rule as background-task cards above: keep them on
+                        // a clean end, take them down on cancel/error/crash.
+                        if keep_background && is_detached_exec_call(tool_args.get(&call_id)) {
+                            tracing::info!(
+                                conv_id = %conversation_id,
+                                %call_id,
+                                tool = %name,
+                                "session-pump: leaving detached exec tool call open past turn end"
+                            );
+                            kept_open.push((call_id, name));
+                            continue;
+                        }
                         tracing::info!(
                             conv_id = %conversation_id,
                             %call_id,
@@ -2853,7 +3235,11 @@ fn spawn_event_pump(
                             input: None,
                             output: None,
                             description: None,
+                            parent_call_id: None,
                         }));
+                    }
+                    for (call_id, name) in kept_open {
+                        open_tools.insert(call_id, name);
                     }
                     // A terminal TurnResult decided this turn; a later Detached is then
                     // an absorbed teardown, not a mid-turn crash (see `crash_outcome`).
@@ -2880,9 +3266,12 @@ fn spawn_event_pump(
                     }
                     // Live tool-output accumulators are per-turn; the authoritative
                     // full output already rode each ToolResult. Drop them so a long
-                    // session doesn't retain every turn's stdout.
-                    tool_output.clear();
-                    tool_name.clear();
+                    // session doesn't retain every turn's stdout — EXCEPT for calls
+                    // still open past this turn end (detached exec): their terminal
+                    // arrives minutes later and `stamp_tool_name` must still find the
+                    // name, or the card re-renders nameless.
+                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
                 }
@@ -3010,6 +3399,7 @@ fn spawn_event_pump(
         ) {
             let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
         }
+        runtime.set_live_background_tasks(workflow_cards.len());
     });
 }
 
@@ -3474,11 +3864,19 @@ fn update_workflow_cards(
                         .and_then(|v| v.as_str())
                         .or_else(|| args.get("command").and_then(|v| v.as_str()))
                         .map(str::to_string);
-                    let mut card = WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms);
+                    // A Task subagent (`local_agent`) gets the "subagent" headline;
+                    // everything else (`local_bash`, unknown) stays "bg task".
+                    let is_agent = matches!(kind, Some(SubagentTaskKind::AgentContainer));
+                    let mut card = if is_agent {
+                        WorkflowCard::new_subagent(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    } else {
+                        WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms)
+                    };
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
                         %call_id,
+                        subagent = is_agent,
                         "session-pump: background task card opened"
                     );
                     // No roster will ever arrive to trigger a first emission, so
@@ -3531,6 +3929,7 @@ fn update_workflow_cards(
                                 input: None,
                                 output: None,
                                 description: None,
+                                parent_call_id: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -3630,6 +4029,21 @@ fn update_workflow_cards(
 /// long ago. Without this a killed or crashed workflow leaves its container card
 /// and every agent row spinning forever, and `hasRunningToolMessages` keeps the
 /// conversation's running indicator lit with nothing left to clear it.
+/// Does this tool call's recorded arguments identify a codex command that runs
+/// DETACHED from the prompt turn?
+///
+/// codex's `unified_exec` starts the process in a PTY with a background exit
+/// watcher, so the model may finish its turn long before the command's own
+/// completion item arrives. The item carries that provenance verbatim in
+/// `source: "unifiedExecStartup"` (a codex wire field passed through by
+/// `codex_conn`, live-captured 0.145.0); `unifiedExecInteraction` is the
+/// follow-up interaction shape of the same family.
+fn is_detached_exec_call(args: Option<&serde_json::Value>) -> bool {
+    args.and_then(|v| v.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with("unifiedExec"))
+}
+
 fn settle_workflow_cards(
     cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
     status: crate::workflow_progress::CardStatus,
@@ -3747,6 +4161,7 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
         tip_type,
         code: Some(code.to_owned()),
         params: None,
+        supersedes_key: None,
     })
 }
 
@@ -3784,6 +4199,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             tool_use_id,
             name,
             input,
+            parent_tool_use_id,
             ..
         } => {
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -3794,12 +4210,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: Some(input),
                 output: None,
                 description: None,
+                // Subagent attribution (009 H5): persisted onto the row so the
+                // frontend can group a subagent's steps under its Task call.
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::ToolResult {
             tool_use_id,
             is_error,
             content,
+            parent_tool_use_id,
             ..
         } => {
             let output = tool_result_text(&content);
@@ -3815,6 +4235,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 input: None,
                 output,
                 description: None,
+                parent_call_id: parent_tool_use_id,
             })]
         }
         SessionEvent::TurnResult {
@@ -3942,6 +4363,22 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 ),
             )]
         }
+        // Structured question (claude AskUserQuestion) → its own `ask` frame; the
+        // frontend renders a multi-question card and answers via confirm with the
+        // full per-question set. Deliberately NOT projected into AcpPermission
+        // options anymore — that flattening dropped every question after the first
+        // (the reason the tool was disabled at spawn until 2026-08-04).
+        SessionEvent::Ask { request_id, questions } => {
+            vec![AgentStreamEvent::Ask(serde_json::json!({
+                "session_id": conversation_id,
+                "request_id": request_id,
+                "questions": questions,
+            }))]
+        }
+        // The FSM counter side is handled by the reducer; the frontend closes the
+        // card on its own answer. A cross-client "someone else answered" push is a
+        // follow-up (the recovery REST path re-lists open asks on reload).
+        SessionEvent::AskResolved { .. } => Vec::new(),
         // Per-turn usage/cost → the AcpContextUsage passthrough frame the frontend
         // usage indicator reads (shape: cumulative token counters).
         SessionEvent::UsageDelta {
@@ -3993,14 +4430,14 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             usage["output_tokens"] = serde_json::json!(output_tokens);
             vec![AgentStreamEvent::AcpContextUsage(usage)]
         }
-        // A confirmed mode/model switch is NOT forwarded as a stream frame. The origin
-        // frontend's mode/model pickers (AgentModeSelector / AcpModelSelector) track the
-        // selection in local state updated optimistically on the PUT /config-options
-        // call + its REST response — they do NOT consume a config stream frame. And the
-        // origin `useAcpMessage` has no `acp_config_option` case, so any such frame falls
-        // into its `default:` arm and lights the turn timer bar (`setRunning(true)`) —
-        // the "switching mode shows a spurious timer" regression. So emit nothing here;
-        // the selection persist is handled separately by `persist_side_effects`.
+        // Nothing HERE, because this function is stateless: the current-value highlight
+        // lives in the runtime's overrides, so all `translate_event` could build is a
+        // mode-only frame — and the frontend REPLACES its whole snapshot on
+        // `acp_config_option`, which would wipe the sibling model/effort pickers.
+        //
+        // The confirmation is surfaced by the EVENT PUMP instead, which holds the runtime
+        // and re-projects the full snapshot (`emit_config_options_snapshot`). Persisting
+        // the selection is handled separately by `persist_side_effects`.
         SessionEvent::ConfigChanged { .. } => Vec::new(),
         // Handled earlier in the pump (needs runtime overrides for the current-value
         // highlight; projected to an AcpConfigOption frame there). Never reaches this
@@ -4049,6 +4486,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             level,
             message,
             localized,
+            supersedes_key,
         } => {
             let tip_type = match level {
                 aionui_session::NoticeLevel::Info => TipType::Info,
@@ -4067,6 +4505,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 tip_type,
                 code,
                 params,
+                supersedes_key,
             })]
         }
         // Agent-generated session title (claude generate_session_title, spec
@@ -4075,6 +4514,17 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         // identically (translate.rs emits the same frame for real ACP agents).
         SessionEvent::SessionTitle { title } => {
             vec![AgentStreamEvent::AcpSessionInfo(serde_json::json!({ "title": title }))]
+        }
+        // Mid-turn interjection (Task 3): lower the claude command_lifecycle echo
+        // to an internal-only stream frame so the conversation layer's
+        // BackgroundStreamWatcher can tell an agent-started turn that SERVES a
+        // user message (claim it) from a pure background continuation (leave it
+        // unclaimed). Consumed inside the relay/watcher, never forwarded to the
+        // WebSocket.
+        SessionEvent::MessageLifecycle { client_msg_id, phase } => {
+            vec![AgentStreamEvent::MessageLifecycle(
+                crate::protocol::events::MessageLifecycleData { client_msg_id, phase },
+            )]
         }
         // Events with no origin-side counterpart (or purely internal) are dropped.
         // Cancel folds into the Finish emitted by the resulting terminal; Heartbeat,
@@ -4334,6 +4784,233 @@ mod build_mapping_tests {
         }
     }
 
+    struct DirectMcpRepo {
+        rows: Vec<aionui_db::models::McpServerRow>,
+    }
+
+    #[derive(Default)]
+    struct RecordingFailSpawner {
+        last_command: std::sync::Mutex<Option<aionui_common::CommandSpec>>,
+    }
+
+    impl RecordingFailSpawner {
+        fn last_command(&self) -> Option<aionui_common::CommandSpec> {
+            self.last_command.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl aionui_process::Spawner for RecordingFailSpawner {
+        async fn spawn(
+            &self,
+            spec: aionui_common::CommandSpec,
+            _extra_env: &[(String, String)],
+            _opaque_owner_tag: &str,
+        ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            *self.last_command.lock().unwrap() = Some(spec);
+            Err(aionui_process::ProcessError::internal(
+                "recording spawner deliberately stops after assembly",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IMcpServerRepository for DirectMcpRepo {
+        async fn list(&self, user_id: &str) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
+        }
+
+        async fn find_by_id(
+            &self,
+            user_id: &str,
+            id: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
+        }
+
+        async fn find_by_name(
+            &self,
+            user_id: &str,
+            name: &str,
+        ) -> Result<Option<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
+        }
+
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<aionui_db::models::McpServerRow, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn batch_upsert(
+            &self,
+            _user_id: &str,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<aionui_db::models::McpServerRow>, aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_status(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!("not needed for direct assembly test")
+        }
+    }
+
+    fn direct_mcp_row(id: &str, name: &str) -> aionui_db::models::McpServerRow {
+        aionui_db::models::McpServerRow {
+            id: id.into(),
+            user_id: "user-1".into(),
+            name: name.into(),
+            description: None,
+            enabled: true,
+            transport_type: "http".into(),
+            transport_config: r#"{"url":"http://127.0.0.1:9999/mcp"}"#.into(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_claude_spawn_contains_team_nonbuiltin_and_builtin_without_reserved_override() {
+        use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TeamMcpStdioConfig};
+
+        let executable = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            mcp_server_ids: Some(vec!["mcp-docs".into(), "mcp-reserved".into()]),
+            session_mcp_servers: vec![
+                SessionMcpServer {
+                    id: "mcp-chrome".into(),
+                    name: "chrome-devtools".into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable.clone(),
+                        args: vec!["chrome-devtools-mcp".into()],
+                        env: Default::default(),
+                    },
+                },
+                SessionMcpServer {
+                    id: "mcp-inline-collision".into(),
+                    name: TEAM_MCP_SERVER_NAME.into(),
+                    transport: SessionMcpTransport::Stdio {
+                        command: executable,
+                        args: vec!["malicious".into()],
+                        env: Default::default(),
+                    },
+                },
+            ],
+            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
+                team_id: "team-1".into(),
+                port: 9000,
+                token: "tok".into(),
+                slot_id: "slot-1".into(),
+                binary_path: "/usr/bin/team-coordinator".into(),
+            }),
+            ..Default::default()
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(DirectMcpRepo {
+            rows: vec![
+                direct_mcp_row("mcp-docs", "mcp-docs"),
+                direct_mcp_row("mcp-reserved", TEAM_MCP_SERVER_NAME),
+            ],
+        });
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let result = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-direct-mcp".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: Some(&repo),
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "FakeSpawner deliberately fails after recording the spawn"
+        );
+
+        let command = spawner.last_command().expect("direct backend must reach spawn");
+        let mcp_flag = command
+            .args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("direct claude spawn must carry --mcp-config");
+        let config_json: serde_json::Value =
+            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+        let servers = config_json["mcpServers"].as_object().expect("MCP server map");
+
+        assert_eq!(servers.len(), 3);
+        assert!(servers.contains_key("mcp-docs"));
+        assert!(servers.contains_key("chrome-devtools"));
+        assert_eq!(
+            servers[TEAM_MCP_SERVER_NAME]["command"],
+            serde_json::json!("/usr/bin/team-coordinator"),
+            "the coordination MCP must survive both repo and inline reserved-name collisions"
+        );
+    }
+
     #[test]
     fn session_cli_program_prefers_explicit_command_override() {
         let mut metadata = test_metadata(Some("claude"), None);
@@ -4376,6 +5053,71 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    // A catalog row carrying the persisted `{available_models:[{id,label}]}` shape the
+    // handshake write-back stores, for the stale-selection guard.
+    fn metadata_with_models(ids: &[&str]) -> aionui_api_types::AgentMetadata {
+        let mut md = test_metadata(Some("claude"), None);
+        md.handshake.available_models = Some(serde_json::json!({
+            "available_models": ids.iter().map(|id| serde_json::json!({"id": id, "label": id})).collect::<Vec<_>>(),
+            "current_model_id": ids.first().copied().unwrap_or_default(),
+        }));
+        md
+    }
+
+    /// A persisted selection the agent no longer advertises is DROPPED at build time,
+    /// so the session falls back to the agent default instead of failing on the user's
+    /// first message. No backend validates a model id at spawn — claude echoes a bogus
+    /// one into `system.init.model` and only dies at turn time (LIVE-PROBED 2.1.231 for
+    /// both `--model` and in-band `set_model`) — so this is the only guard that runs
+    /// before the user is affected.
+    #[test]
+    fn stale_model_selection_is_dropped_before_it_reaches_the_backend() {
+        let cfg = AcpBuildExtra {
+            // A concrete id that only existed under a previous ANTHROPIC_DEFAULT_* /
+            // provider env or CLI version.
+            current_model_id: Some("claude-opus-4-8[1m]".into()),
+            ..Default::default()
+        };
+        let md = metadata_with_models(&["default", "sonnet", "opus", "haiku"]);
+        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md);
+        assert_eq!(model, None, "an id absent from the catalog must not be sent");
+
+        // A selection the catalog DOES advertise survives untouched.
+        let live = AcpBuildExtra {
+            current_model_id: Some("haiku".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md);
+        assert_eq!(model.as_deref(), Some("haiku"));
+
+        // `default` is a real catalog row, so it survives here; suppressing it is the
+        // claude backend's job (`desired_model_from_config`), not this guard's.
+        let default_row = AcpBuildExtra {
+            current_model_id: Some("default".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md);
+        assert_eq!(model.as_deref(), Some("default"));
+    }
+
+    /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
+    /// invalid — dropping it there would break the very first session of every agent,
+    /// including codex/ACP backends that share this path.
+    #[test]
+    fn model_selection_passes_through_when_no_catalog_is_known_yet() {
+        let cfg = AcpBuildExtra {
+            current_model_id: Some("gpt-5.6-terra".into()),
+            ..Default::default()
+        };
+        // handshake.available_models = None
+        let (_spec, _mode, model) = spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "absent catalog ⇒ pass through");
+
+        // An EMPTY catalog is equally uninformative.
+        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "empty catalog ⇒ pass through");
     }
 
     /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
@@ -4738,6 +5480,7 @@ mod translate_tests {
             input: None,
             output: None,
             description: None,
+            parent_call_id: None,
         })
     }
 
@@ -4936,6 +5679,7 @@ mod translate_tests {
                     level,
                     message: "set effort: rejected by agent".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 "conv-1",
                 false,
@@ -4950,13 +5694,24 @@ mod translate_tests {
         }
     }
 
-    // A ConfigChanged must NOT produce any stream frame: the origin frontend's mode/
-    // model pickers track selection in local state (optimistic on the PUT + its REST
-    // response), and an `acp_config_option` frame would fall into origin useAcpMessage's
-    // `default:` arm and light a spurious turn timer bar. The selection is still
-    // persisted separately (see persist_tests::config_changed_persists_mode_and_model).
+    // A ConfigChanged produces no frame FROM `translate_event` — this function is
+    // stateless and cannot read the runtime's overrides, so it could only build a
+    // mode-only frame, and the frontend REPLACES its whole snapshot on
+    // `acp_config_option` (`useAcpConfigOptions` -> `replaceSnapshot`), which would wipe
+    // the model/effort pickers.
+    //
+    // The confirmation IS surfaced — by the event pump, which holds the runtime and
+    // re-projects the WHOLE snapshot (see
+    // pump_tests::config_changed_projects_confirmed_mode_to_frontend). The selection is
+    // persisted separately (persist_tests::config_changed_persists_mode_and_model).
+    //
+    // NOTE: an earlier version of this comment justified the suppression by claiming the
+    // frontend "does not consume a config stream frame" and that such a frame lands in
+    // `useAcpMessage`'s `default:` arm lighting a spurious timer. Both were fixed
+    // upstream: `useAcpConfigOptions` subscribes to `acp_config_option`, and
+    // `useAcpMessage` has an explicit no-op case for it.
     #[test]
-    fn config_changed_emits_no_frame() {
+    fn config_changed_emits_no_frame_from_stateless_translate() {
         let events = translate_event(
             SessionEvent::ConfigChanged {
                 mode: Some("plan".into()),
@@ -6085,8 +6840,8 @@ mod pump_tests {
     }
 
     // Image-capable backend: an image attachment leaves the [[AION_FILES]]
-    // text and rides as a native Image block; non-media files keep the
-    // path-text + resource-link form.
+    // text and rides as a native Image block PAIRED with a link to the same
+    // file; non-media files keep the path-text + resource-link form.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_message_partitions_image_into_native_block() {
         let dir = std::env::temp_dir().join("aionui-session-media-tests");
@@ -6134,7 +6889,11 @@ mod pump_tests {
         let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
             panic!("expected a Send command");
         };
-        assert_eq!(content.len(), 3, "text + pdf link + image block: {content:?}");
+        assert_eq!(
+            content.len(),
+            4,
+            "text + pdf link + image block + the image's own link: {content:?}"
+        );
         let ContentBlock::Text(text) = &content[0] else {
             panic!("expected text first: {content:?}");
         };
@@ -6148,6 +6907,261 @@ mod pump_tests {
         };
         assert_eq!(data, b"catbytes");
         assert_eq!(media_type, "image/png");
+        let ContentBlock::ResourceLink { uri, mime_type } = &content[3] else {
+            panic!("expected the image's paired resource link fourth: {content:?}");
+        };
+        assert_eq!(uri, &img);
+        assert_eq!(mime_type.as_deref(), Some("image/png"));
+    }
+
+    // Regression guard (Sentry 7677917218): a natively-delivered image must ALSO
+    // carry its disk path. Without the paired link the agent sees pixels but has
+    // no path for its Read tool — it can look at the image but not open the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_pairs_image_block_with_resource_link() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("qr.png");
+        std::fs::write(&img, b"qrbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: true,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-link".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        let marker = aionui_common::constants::AIONUI_FILES_MARKER;
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: format!("replace the qr code\n\n{marker}\n{img}"),
+                msg_id: "m-link".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        let linked: Vec<&str> = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ResourceLink { uri, .. } => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            linked,
+            vec![img.as_str()],
+            "the image's path must ride along as a resource link: {content:?}"
+        );
+    }
+
+    // Capability gate: a backend that takes images but NOT resource links must not
+    // receive the paired link — `BlockSet::allows` rejects an un-advertised block
+    // and that rejection kills the WHOLE Send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_message_omits_media_link_when_resource_block_unsupported() {
+        let dir = std::env::temp_dir().join("aionui-session-media-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("no-link.png");
+        std::fs::write(&img, b"pngbytes").unwrap();
+        let img = img.to_string_lossy().into_owned();
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet {
+                text: true,
+                image: true,
+                audio: false,
+                resource: false,
+                at_mention: false,
+            },
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-nolink".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        crate::agent_task::IAgentTask::send_message(
+            task.as_ref(),
+            SendMessageData {
+                content: "look".into(),
+                msg_id: "m-nolink".into(),
+                turn_id: None,
+                files: vec![img.clone()],
+                inject_skills: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        let Some(Command::Send { content, .. }) = commands.iter().find(|c| matches!(c, Command::Send { .. })) else {
+            panic!("expected a Send command");
+        };
+        assert!(
+            content.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+            "image block missing: {content:?}"
+        );
+        assert!(
+            !content.iter().any(|b| matches!(b, ContentBlock::ResourceLink { .. })),
+            "must not emit a resource link to a backend that does not advertise it: {content:?}"
+        );
+    }
+
+    /// A codex detached exec (`source: unifiedExecStartup`) is still RUNNING when
+    /// the model ends its prompt turn; the pump must not paint it Canceled — the
+    /// command's own completion settles it later. A foreground tool left open at
+    /// the same clean turn end must still be cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_turn_end_keeps_detached_exec_card_but_cancels_others() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({
+                "type": "commandExecution",
+                "command": "/bin/zsh -lc 'bun run build'",
+                "status": "inProgress",
+                "source": "unifiedExecStartup"
+            }),
+            parent_tool_use_id: None,
+        };
+        let foreground = SessionEvent::ToolCall {
+            tool_use_id: "call-plain".into(),
+            name: "fileChange".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "fileChange" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(foreground), env(clean_end)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut canceled: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data))) if data.status == ToolCallStatus::Canceled => {
+                    canceled.push(data.call_id);
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !canceled.iter().any(|id| id == "call-detached"),
+            "detached exec card must survive a clean turn end, got cancels: {canceled:?}"
+        );
+        assert!(
+            canceled.iter().any(|id| id == "call-plain"),
+            "a non-detached tool left open must still be cancelled, got: {canceled:?}"
+        );
+    }
+
+    /// The detached exec's terminal lands MINUTES after the turn ended. The
+    /// per-turn name map must keep the entry for calls left open, or the late
+    /// frame goes out nameless and the card re-renders with a blank title.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_terminal_of_a_kept_open_exec_still_carries_the_tool_name() {
+        use aionui_session::TurnOutcome;
+        let detached = SessionEvent::ToolCall {
+            tool_use_id: "call-detached".into(),
+            name: "commandExecution".into(),
+            subagent: aionui_session::SubagentKind::Inline,
+            input: serde_json::json!({ "type": "commandExecution", "source": "unifiedExecStartup" }),
+            parent_tool_use_id: None,
+        };
+        let clean_end = SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: TurnOutcome::Completed {
+                stop_reason: aionui_session::StopReason::EndTurn,
+            },
+        };
+        let late_result = SessionEvent::ToolResult {
+            tool_use_id: "call-detached".into(),
+            is_error: false,
+            content: vec![],
+            parent_tool_use_id: None,
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ScriptBackend(vec![env(detached), env(clean_end), env(late_result)]));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let _ = task;
+
+        let mut terminal_names: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(AgentStreamEvent::ToolCall(data)))
+                    if data.call_id == "call-detached" && data.status == ToolCallStatus::Completed =>
+                {
+                    terminal_names.push(data.name.clone());
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            terminal_names.iter().any(|n| n == "commandExecution"),
+            "late terminal must keep the tool name, got: {terminal_names:?}"
+        );
     }
 
     fn env(event: SessionEvent) -> SessionEnvelope {
@@ -6197,6 +7211,41 @@ mod pump_tests {
             // sequence flow — so no frame can predate the test's subscribe().
             futures_util::stream::once(async move { gate.notified().await })
                 .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    /// Like `GatedScriptBackend`, but the stream stays OPEN after the script —
+    /// for asserting mid-flight pump state (a closed stream tears the pump down,
+    /// which settles every card and zeroes `live_background_tasks`).
+    struct HeldOpenScriptBackend {
+        script: Vec<SessionEnvelope>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for HeldOpenScriptBackend {
+        async fn dispatch(&self, c: Command) -> Result<CommandReceipt, BackendError> {
+            let admission = match c {
+                Command::Send { .. } => Admission::Started,
+                _ => Admission::NoTurn,
+            };
+            Ok(CommandReceipt {
+                accepted: true,
+                admission,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            let gate = self.gate.clone();
+            let script = self.script.clone();
+            futures_util::stream::once(async move { gate.notified().await })
+                .flat_map(move |_| futures_util::stream::iter(script.clone()))
+                .chain(futures_util::stream::pending())
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
@@ -6468,6 +7517,92 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // An agent-CONFIRMED mode switch must reach the frontend as an `acp_config_option`
+    // frame carrying the confirmed value. This is the ONLY honest "it actually took
+    // effect" signal: for the direct-CLI backends the PUT response is optimistic —
+    // `set_config_option` caches the requested value as an override and reads it
+    // straight back — so without this frame the picker shows a mode the agent may not
+    // have applied. codex applies `thread/settings/update` only from the NEXT turn
+    // (verified: samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json,
+    // "Override the approval policy for subsequent turns"), and claude confirms
+    // asynchronously via `system/status{permissionMode}` (verified:
+    // samples/claude-cli/2.1.227/set_permission_mode/).
+    //
+    // The frame carries the WHOLE snapshot (mode + model together) because the frontend
+    // REPLACES its snapshot on this frame (`useAcpConfigOptions.ts` -> `replaceSnapshot`);
+    // a mode-only frame would wipe the model picker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_changed_projects_confirmed_mode_to_frontend() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let script = vec![
+            // The catalog must land first: the pump holds no backend Arc (see
+            // `spawn_event_pump`) and so cannot rebuild the option list on its own.
+            env(SessionEvent::CatalogUpdated {
+                models: vec![ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                    description: None,
+                    reasoning_efforts: Vec::new(),
+                }],
+                modes: vec![
+                    ModeInfo {
+                        id: "default".into(),
+                        name: "Default".into(),
+                        description: None,
+                    },
+                    ModeInfo {
+                        id: "plan".into(),
+                        name: "Plan".into(),
+                        description: None,
+                    },
+                ],
+                slash_commands: Vec::new(),
+            }),
+            // The agent reports it really switched (claude `system/status`, codex
+            // `thread/settings/updated`).
+            env(SessionEvent::ConfigChanged {
+                mode: Some("plan".into()),
+                model: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let config_frames: Vec<&serde_json::Value> = frames
+            .iter()
+            .filter_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            config_frames.len() >= 2,
+            "the confirmation must project its own frame (catalog frame + confirmation frame), got {} frame(s)",
+            config_frames.len()
+        );
+        let options = config_frames
+            .last()
+            .unwrap()
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let mode_opt = options
+            .iter()
+            .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("mode"))
+            .expect("mode category must ride the confirmation frame");
+        assert_eq!(
+            mode_opt.get("current_value").and_then(|v| v.as_str()),
+            Some("plan"),
+            "the picker must highlight the mode the AGENT confirmed, not the optimistic request"
+        );
+        let categories: Vec<&str> = options
+            .iter()
+            .filter_map(|o| o.get("category").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            categories.contains(&"model"),
+            "the sibling model category must survive the confirmation frame (frontend REPLACES), got {categories:?}"
         );
     }
 
@@ -7085,6 +8220,85 @@ mod pump_tests {
         );
     }
 
+    /// A Task subagent (`task_type: local_agent`, kind `AgentContainer`) rides
+    /// the same card machinery as a background bash but must be LABELLED as a
+    /// subagent — with both saying "bg task" the step list could not tell
+    /// delegated agent work from a background shell (live 2026-08-19). Its
+    /// internal tool calls also carry the launching call's id so the frontend
+    /// can group them under the Task row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_subagent_card_is_labelled_subagent_and_children_carry_parent() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            // Shape mirrors claude_2.1.169_single_tool_turn.ndjson: Agent
+            // tool_use → task_started{local_agent} → the subagent's own tool_use
+            // frame carrying parent_tool_use_id.
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_task".into(),
+                name: "修复 AIONUI-151 桌面 401 恢复".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({
+                    "description": "修复 AIONUI-151 桌面 401 恢复",
+                    "subagent_type": "claude",
+                    "run_in_background": false
+                }),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: Some("claude".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_task".into()),
+                kind: Some(SubagentTaskKind::AgentContainer),
+            }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_inner".into(),
+                name: "Read httpBridge.ts".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"file_path": "/tmp/httpBridge.ts"}),
+                parent_tool_use_id: Some("toolu_task".into()),
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "ae859b22dc5afbdca".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("toolu_task".into()),
+                kind: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+
+        let progress = wf_frames(&frames);
+        assert!(!progress.is_empty(), "the subagent card must emit on open");
+        let desc = progress[0].card.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.contains("subagent ae859b22dc5afbdca"),
+            "a Task subagent's card says 'subagent', not 'bg task': {desc}"
+        );
+        assert!(!desc.contains("bg task"), "not a bg task: {desc}");
+
+        // Attribution: the subagent's INTERNAL call carries the Task call's id;
+        // the Task launch itself (a main-agent call) carries none.
+        let parent_of = |id: &str| {
+            frames.iter().find_map(|f| match f {
+                AgentStreamEvent::ToolCall(d) if d.call_id == id && d.status == ToolCallStatus::Running => {
+                    Some(d.parent_call_id.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            parent_of("toolu_inner"),
+            Some(Some("toolu_task".into())),
+            "a subagent-internal call must carry its Task call's id"
+        );
+        assert_eq!(
+            parent_of("toolu_task"),
+            Some(None),
+            "the main-agent launching call carries no parent"
+        );
+    }
+
     /// A CANCELLED turn takes background-task cards down with it: the interrupt
     /// kills background tasks silently (no task frames follow — per the #732
     /// capture), so waiting for a notification would strand the card spinning.
@@ -7370,6 +8584,134 @@ mod pump_tests {
         );
     }
 
+    /// The idle scanner reads `live_background_tasks()` to keep from killing an
+    /// agent whose background work outlives its turn (five real IdleTimeout
+    /// misfires over 2026-08-08..10, each cutting down a 10-45 min gate run).
+    /// A declared background card that survives its launch turn must be counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_background_card_counts_as_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 900", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("toolu_bash".into()),
+                kind: Some(SubagentTaskKind::Other),
+            }),
+            // Clean turn end: the background card survives it (that is the
+            // whole point of #732) — and must keep the agent counted busy.
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        // Held-open stream: the background task is still "running", so the
+        // backend must not close (teardown settles cards and zeroes the count).
+        let backend: Arc<dyn SessionBackend> = Arc::new(HeldOpenScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let _rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // The pump processes the script asynchronously; poll instead of racing it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()) != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open background card never reflected in live_background_tasks"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Counterpart: the task's own terminal settles the card and the counter
+    /// must drop back to 0 — otherwise the idle scanner would protect the
+    /// agent forever and idle cleanup would never fire again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_card_terminal_clears_live_background_task() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let bash_env = |status: SubagentStatus, kind: Option<SubagentTaskKind>| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "task-bash".into(),
+                label: Some("local_bash".into()),
+                status,
+                parent_ref: Some("toolu_bash".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_bash".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 1", "run_in_background": true}),
+                parent_tool_use_id: None,
+            }),
+            bash_env(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            // The out-of-turn terminal (task_notification on the wire).
+            bash_env(SubagentStatus::Completed, None),
+        ];
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
+            script,
+            gate: gate.clone(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        gate.notify_one();
+
+        // Drain to exhaustion: after the terminal the card is gone, the ticker
+        // disarms, and the stream quiesces. Require the card to have existed so
+        // the final 0 is a transition, not a vacuous default.
+        let mut saw_card = false;
+        while let Ok(Ok(ev)) = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await {
+            if matches!(ev, AgentStreamEvent::WorkflowProgress(_)) {
+                saw_card = true;
+            }
+        }
+        assert!(saw_card, "the background card must have opened during the script");
+        assert_eq!(
+            crate::agent_task::IAgentTask::live_background_tasks(task.as_ref()),
+            0,
+            "a settled card must release the idle-scanner protection"
+        );
+    }
+
     // A workflow-launch result that is itself an ERROR is NOT suppressed — the user
     // must see a genuine failure even mid-workflow (suppression covers only clean
     // completion ordering, per the fixture invariant).
@@ -7482,8 +8824,7 @@ mod pump_tests {
         // watcher owns them.
         let last_turn_frame = frames
             .iter()
-            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-            .next_back();
+            .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)));
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
@@ -7555,8 +8896,7 @@ mod pump_tests {
         assert!(
             frames
                 .iter()
-                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-                .next_back()
+                .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
                 .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );
@@ -7885,12 +9225,16 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
             request_id: "req-recover".into(),
             tool_name: "AskUserQuestion".into(),
-            questions: Some(serde_json::json!({
-                "questions": [{
-                    "question": "Which?",
-                    "options": [{"label": "A"}, {"label": "B"}]
-                }]
-            })),
+            // The BARE questions[] array — matching what claude_conn's
+            // pending_permission_requests() actually stores
+            // (`perm.input.get("questions").cloned()`). The old fixture carried
+            // the {questions:[…]} wrapper, so the projection passed here while
+            // silently degrading to Allow/Reject against the real backend
+            // (caught live in the 2026-08-04 e2e).
+            questions: Some(serde_json::json!([{
+                "question": "Which?",
+                "options": [{"label": "A"}, {"label": "B"}]
+            }])),
         }));
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -8022,6 +9366,275 @@ mod pump_tests {
             mode_opt.current_value.as_deref(),
             Some("plan"),
             "current_value reflects the switch"
+        );
+    }
+
+    /// A backend that advertises an effort axis with a current level, like claude does
+    /// once `system/init` lands. Mirrors `StaticCapsBackend` otherwise.
+    pub(super) struct EffortCapsBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for EffortCapsBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            use aionui_session::ModelInfo;
+            Capabilities {
+                available_models: vec![ModelInfo {
+                    id: "opus".into(),
+                    name: "Opus".into(),
+                    description: None,
+                    reasoning_efforts: vec!["low".into(), "high".into()],
+                }],
+                current_model: Some("opus".into()),
+                // The user never picked this explicitly — it is what the CLI reported.
+                current_effort: Some("high".into()),
+                ..StaticCapsBackend.capabilities()
+            }
+        }
+    }
+
+    /// A backend that never announces a catalog, like agy: its modes are static, so it
+    /// has nothing to push and only ever exposes them through `capabilities()`.
+    pub(super) struct NoCatalogEventBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for NoCatalogEventBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            StaticCapsBackend.capabilities()
+        }
+    }
+
+    /// A confirmation must reach the frontend even when the backend never emits
+    /// `CatalogUpdated`.
+    ///
+    /// The pump re-projects the option snapshot from the last catalog it saw, but agy
+    /// emits none at all (its modes are static — zero `CatalogUpdated` in that backend).
+    /// Gating the confirmation on that catalog meant agy's frame was never sent, so the
+    /// picker sat on "switching…" forever with no signal that could ever clear it — the
+    /// user could not tell when, or whether, the switch had landed.
+    ///
+    /// REST is the missing supply: `get_config_options` holds the backend handle and the
+    /// full catalog, and the frontend always reads it before switching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backend_without_catalog_events_still_confirms() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(NoCatalogEventBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        // What the frontend does on mount — and the only place this backend's catalog
+        // is ever visible.
+        let _ = task.get_config_options().await.unwrap();
+
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        let runtime = task.runtime_for_test();
+        runtime.set_mode_override("plan".to_string());
+        let Some((modes, models)) = runtime.last_catalog() else {
+            panic!("reading config options must leave the pump a catalog to re-project");
+        };
+        emit_config_options_snapshot(&modes, &models, runtime);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(ev) = rx.recv().await {
+                if let AgentStreamEvent::AcpConfigOption(v) = ev {
+                    return Some(v);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("a confirmation frame must be emitted");
+
+        let mode = frame
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("mode"))
+            })
+            .expect("the mode axis must ride the frame");
+        assert_eq!(mode.get("current_value").and_then(|v| v.as_str()), Some("plan"));
+    }
+
+    /// A confirmation frame must not blank out the OTHER axes it re-sends.
+    ///
+    /// The frontend REPLACES its whole snapshot on `acp_config_option`, so every axis in
+    /// that frame overwrites what the picker had. The pump resolves each highlight from
+    /// the runtime's optimistic overrides, which are `None` for an axis the user never
+    /// touched — so re-projecting after a mode confirmation wiped the effort level that
+    /// REST had correctly reported from `capabilities().current_effort`, and the "思考强度"
+    /// picker went blank on every mode switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_confirmation_frame_preserves_the_effort_level() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        // The frontend always reads REST first; that is where the effort level becomes
+        // known, and it is the value the confirmation frame must not contradict.
+        let rest = task.get_config_options().await.unwrap();
+        assert_eq!(
+            rest.config_options
+                .iter()
+                .find(|o| o.category.as_deref() == Some("thought_level"))
+                .and_then(|o| o.current_value.as_deref()),
+            Some("high"),
+            "precondition: REST reports the effort level from capabilities"
+        );
+
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        task.runtime_for_test().set_last_catalog(
+            vec![ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            }],
+            vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+        );
+        emit_config_options_snapshot(
+            &[ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            }],
+            &[ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into()],
+            }],
+            task.runtime_for_test(),
+        );
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(ev) = rx.recv().await {
+                if let AgentStreamEvent::AcpConfigOption(v) = ev {
+                    return Some(v);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("a config-option frame");
+
+        let effort = frame
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                a.iter()
+                    .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("thought_level"))
+            })
+            .expect("the effort axis must ride the frame");
+        assert_eq!(
+            effort.get("current_value").and_then(|v| v.as_str()),
+            Some("high"),
+            "the pushed frame must not blank the effort level the user can see"
+        );
+    }
+
+    /// A backend that applies a mode switch only from the NEXT turn, e.g. codex
+    /// ("Override the approval policy for subsequent turns" —
+    /// samples/codex-cli/0.146.0/schema/v2/ThreadSettingsUpdateParams.json), or claude
+    /// while a turn is in flight (the control frame is queued and drained before the
+    /// next prompt).
+    pub(super) struct NextTurnEffectBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for NextTurnEffectBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                mode_switch_effect: aionui_session::ModeSwitchEffect::NextTurn,
+                ..StaticCapsBackend.capabilities()
+            }
+        }
+    }
+
+    /// When the backend cannot apply the switch until the next turn, the response must
+    /// SAY so instead of reporting `Observed`.
+    ///
+    /// `Observed` here was self-fulfilling: the task cached the requested value as an
+    /// optimistic override and then read it straight back, so the frontend was told the
+    /// switch had landed while the agent was still enforcing the old mode — the whole
+    /// point of this change. The reported `current_value` must likewise stay on the mode
+    /// actually in force, because that is what the picker shows as "the permission you
+    /// have right now".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_next_turn_backend_reports_pending_not_observed() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(NextTurnEffectBackend);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let resp = task.set_config_option("mode", "plan").await.unwrap();
+        assert!(
+            matches!(
+                resp.confirmation,
+                aionui_api_types::ConfigOptionConfirmation::PendingNextTurn
+            ),
+            "a next-turn backend must report PendingNextTurn, got {:?}",
+            resp.confirmation
+        );
+        let opts = resp.config_options.expect("config_options present");
+        let mode_opt = opts.iter().find(|o| o.id == "mode").expect("mode option");
+        assert_eq!(
+            mode_opt.current_value.as_deref(),
+            Some("default"),
+            "current_value must stay on the mode still in force, not jump to the request"
         );
     }
 
@@ -8442,6 +10055,52 @@ mod force_kill_tests {
         }
     }
 
+    /// Task-1 brief: `SessionAgentTask::supports_midturn_delivery` must read
+    /// straight through to the backend's declared capability bit — no
+    /// reinterpretation, no default override.
+    struct MidturnCapableBackend {
+        supports_midturn_delivery: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for MidturnCapableBackend {
+        async fn dispatch(&self, _c: Command) -> Result<CommandReceipt, BackendError> {
+            Ok(CommandReceipt {
+                accepted: true,
+                admission: Admission::NoTurn,
+                turn_gen: 1,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                supports_midturn_delivery: self.supports_midturn_delivery,
+                ..Capabilities::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_midturn_delivery_reads_through_backend_capabilities() {
+        for expected in [true, false] {
+            let backend: Arc<dyn SessionBackend> = Arc::new(MidturnCapableBackend {
+                supports_midturn_delivery: expected,
+            });
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            assert_eq!(IAgentTask::supports_midturn_delivery(task.as_ref()), expected);
+        }
+    }
+
     fn build_task_with_counter() -> (Arc<SessionAgentTask>, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
         let backend: Arc<dyn SessionBackend> = Arc::new(TerminateCountingBackend {
@@ -8550,6 +10209,24 @@ mod force_kill_tests {
         let again = next_terminal(&mut rx).await;
         assert!(again.is_none(), "no second Finish broadcast, got {again:?}");
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_forces_clean_finish_and_terminates_backend() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::RuntimeRestart)).await;
+
+        let terminal = next_terminal(&mut rx).await.expect("a terminal frame after restart");
+        assert!(
+            matches!(terminal, AgentStreamEvent::Finish(_)),
+            "runtime restart must finish the turn without an Error frame, got {terminal:?}"
+        );
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// T6: isolation — non-`UserCancelTimeout` reasons keep the original
@@ -8843,5 +10520,28 @@ mod catalog_writeback_tests {
             nested_len(msg.handshake.available_modes.as_ref(), "available_modes") > 0,
             "expected the modes-only partial to be published"
         );
+    }
+
+    #[test]
+    fn detached_exec_calls_are_recognised_by_codex_item_source() {
+        use serde_json::json;
+        // Live-captured shape (codex 0.145.0): every commandExecution item the
+        // model launches carries `source: "unifiedExecStartup"`.
+        let startup = json!({
+            "type": "commandExecution",
+            "command": "/bin/zsh -lc 'bun run build'",
+            "status": "inProgress",
+            "source": "unifiedExecStartup"
+        });
+        assert!(super::is_detached_exec_call(Some(&startup)));
+        let interaction = json!({ "type": "commandExecution", "source": "unifiedExecInteraction" });
+        assert!(super::is_detached_exec_call(Some(&interaction)));
+
+        // Foreground/other sources and non-codex tools must still be cancelled
+        // at turn end (an orphaned card would otherwise spin forever).
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "agent" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "source": "userShell" }))));
+        assert!(!super::is_detached_exec_call(Some(&json!({ "command": "ls" }))));
+        assert!(!super::is_detached_exec_call(None));
     }
 }

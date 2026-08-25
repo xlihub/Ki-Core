@@ -16,7 +16,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
 };
-use aionui_api_types::ErrorResponse;
+use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
@@ -34,8 +34,9 @@ use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
 use aionui_project::project_routes;
-use aionui_realtime::{NoopMessageRouter, WsHandlerState, ws_upgrade_handler};
+use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
+use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
@@ -43,13 +44,51 @@ use crate::services::AppServices;
 
 use super::fs_monitor::spawn_fs_monitor;
 use super::health::health_check;
+use aionui_session_message::{session_message_routes, session_message_user_routes};
+
 use super::runtime_team_tools::{RuntimeTeamToolsState, runtime_team_tools_routes};
+use super::scm_monitor::{CompositeMessageRouter, spawn_scm_monitor};
 use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws_state};
 use super::trace::with_access_log;
 
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+}
+
+async fn forward_event_bus_to_websocket(
+    mut event_rx: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    ws_manager: Arc<WebSocketManager>,
+) {
+    loop {
+        let event = match event_rx.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "websocket event bus bridge lagged; skipped stale events and will continue"
+                );
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+
+        if let Some(user_id) = event
+            .data
+            .get("user_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        {
+            ws_manager.broadcast_to_user(&user_id, event);
+        } else if is_global_websocket_event(&event.name) {
+            ws_manager.broadcast_all(event);
+        } else {
+            tracing::warn!(
+                event_name = %event.name,
+                "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
+            );
+        }
+    }
 }
 
 /// Create the application router with all routes and global middleware.
@@ -71,27 +110,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
 
     // Bridge event bus → WebSocket manager: forward all broadcast events
     // to connected WebSocket clients.
-    let mut event_rx = services.event_bus.subscribe();
+    let event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
-    tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            if let Some(user_id) = event
-                .data
-                .get("user_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-            {
-                ws_manager.broadcast_to_user(&user_id, event);
-            } else if is_global_websocket_event(&event.name) {
-                ws_manager.broadcast_all(event);
-            } else {
-                tracing::warn!(
-                    event_name = %event.name,
-                    "dropping websocket event without user_id; add user_id to payload or whitelist explicit global event"
-                );
-            }
-        }
-    });
+    tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
 
     let (states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
@@ -144,7 +165,14 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // router (fs/* frames). Built here — inside the runtime — because the actor
     // runs as a background task. The sync test-only assembly path keeps a no-op.
     let fs_router = spawn_fs_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
-    let ws_state = build_ws_state(services, fs_router);
+    // Source control shares the connection but owns its own envelope name, so the
+    // two inbound routers are composed behind the realtime layer's single slot.
+    let scm_router = spawn_scm_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
+    let inbound_router: Arc<dyn aionui_realtime::MessageRouter> = match scm_router {
+        Some(scm) => Arc::new(CompositeMessageRouter::new(vec![fs_router, scm])),
+        None => fs_router,
+    };
+    let ws_state = build_ws_state(services, inbound_router);
     let router = create_router_with_all_state(services, states, ws_state);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -195,7 +223,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             let team_service = states.team.service.clone();
             let channel_manager = states.channel.manager.clone();
             let channel_session_manager = states.channel.session_manager.clone();
-            let file_watch_service = states.file.watch_service.clone();
             let office_watch_manager = states.office.watch_manager.clone();
             Some(Arc::new(move |user_id: &str| {
                 ws_manager.disconnect_user(user_id, "session revoked");
@@ -211,7 +238,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 let conversation_service = conversation_service.clone();
                 let channel_manager = channel_manager.clone();
                 let channel_session_manager = channel_session_manager.clone();
-                let file_watch_service = file_watch_service.clone();
                 let office_watch_manager = office_watch_manager.clone();
                 tokio::spawn(async move {
                     channel_manager.shutdown_for_user(&user_id).await;
@@ -228,20 +254,6 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                             user_id = %user_id,
                             error = %err,
                             "failed to terminate runtimes after session revocation"
-                        );
-                    }
-                    if let Err(err) = file_watch_service.stop_all_watches_for_user(&user_id).await {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = %err,
-                            "failed to stop file watches after session revocation"
-                        );
-                    }
-                    if let Err(err) = file_watch_service.stop_all_office_watches_for_user(&user_id).await {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = %err,
-                            "failed to stop office file watches after session revocation"
                         );
                     }
                 });
@@ -290,6 +302,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Project control-plane routes protected by auth middleware
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // Sidebar read + ordering routes protected by auth middleware
+    let sidebar_authenticated =
+        sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // MCP routes protected by auth middleware
     let mcp_authenticated =
@@ -348,6 +364,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         team_service: states.team.service.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
     });
+    // Runtime routes authenticate on their own token header — deliberately NOT
+    // behind auth_middleware, same as runtime_team_tools.
+    let session_message_runtime = session_message_routes(states.session_message.clone());
+    // The `@@` picker's outlet goes through ordinary user auth.
+    let session_message_authenticated = session_message_user_routes(states.session_message)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     // Antigravity permission hook callback. Deliberately NOT behind
@@ -372,6 +394,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)
+        .merge(sidebar_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
@@ -381,7 +404,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
-        .merge(assistant_authenticated);
+        .merge(assistant_authenticated)
+        .merge(session_message_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -397,6 +421,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(session_message_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));
@@ -563,9 +588,17 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use std::sync::Arc;
 
-    use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
+    use aionui_api_types::WebSocketMessage;
+    use aionui_realtime::{BroadcastEventBus, EventBroadcaster, WebSocketManager, WsOutbound};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    use super::{
+        boundary_error_for_status, create_router_with_runtime, forward_event_bus_to_websocket,
+        is_global_websocket_event,
+    };
     use crate::config::AppConfig;
     use crate::services::AppServices;
 
@@ -608,5 +641,46 @@ mod tests {
         let (_router, _runtime) = create_router_with_runtime(&services)
             .await
             .expect("router runtime should build");
+    }
+
+    #[tokio::test]
+    async fn websocket_event_bridge_continues_after_receiver_lag() {
+        let event_bus = BroadcastEventBus::new(2);
+        let event_rx = event_bus.subscribe();
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(8);
+        ws_manager.add_client_for_user("user-a".into(), "token".into(), outbound_tx);
+
+        for sequence in 1..=3 {
+            event_bus.broadcast(WebSocketMessage::new(
+                "test.beforeLag",
+                json!({"user_id": "user-a", "sequence": sequence}),
+            ));
+        }
+
+        let bridge = tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
+        event_bus.broadcast(WebSocketMessage::new(
+            "test.afterLag",
+            json!({"user_id": "user-a", "sequence": 4}),
+        ));
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::Text(text)) => {
+                        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if event["name"] == "test.afterLag" {
+                            break event;
+                        }
+                    }
+                    other => panic!("expected a text websocket event, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the bridge should deliver events after recovering from lag");
+
+        assert_eq!(delivered["data"]["sequence"], 4);
+        bridge.abort();
     }
 }

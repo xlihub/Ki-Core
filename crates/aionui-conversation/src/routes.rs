@@ -71,6 +71,12 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::RuntimeRestarting { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "runtime_restarting",
+                "Conversation runtime is restarting",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             ConversationError::TeamRuntimeRequired {
                 conversation_id,
                 team_id,
@@ -116,15 +122,24 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
+        // MUST precede the `{messageId}` wildcard below: registered after it,
+        // "latest" would be captured as a message id and 404.
+        .route("/api/conversations/{id}/messages/latest", get(latest_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
+        .route(
+            "/api/conversations/{id}/terminals/{terminalId}/kill",
+            post(kill_terminal),
+        )
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
+        .route("/api/conversations/{id}/runtime/restart", post(restart_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
         .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
+        .route("/api/conversations/{id}/asks/{requestId}/answer", post(answer_ask))
         .route("/api/conversations/{id}/approvals/check", get(check_approval))
         .route("/api/conversations/active-count", get(active_count))
         .route("/api/conversations/clone", post(clone))
@@ -254,6 +269,25 @@ struct MessagePathParams {
     message_id: String,
 }
 
+#[derive(serde::Deserialize)]
+struct LatestMessageQuery {
+    r#type: String,
+}
+
+async fn latest_msg(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<LatestMessageQuery>,
+) -> Result<Json<ApiResponse<Option<MessageResponse>>>, ApiError> {
+    let result = state
+        .service
+        .latest_message_of_type(&user.id, &id, &query.r#type)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
 async fn get_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -279,7 +313,14 @@ async fn send_msg(
         .send_message(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
-    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(response))))
+    // B5: a mid-turn delivery already handed the message to the RUNNING turn —
+    // that is a completed delivery (200), not a scheduled one (202).
+    let status = if response.delivered_midturn {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(ApiResponse::ok(response))))
 }
 
 async fn list_artifacts(
@@ -317,6 +358,19 @@ async fn update_artifact(
     Ok(Json(ApiResponse::ok(artifact)))
 }
 
+async fn kill_terminal(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, terminal_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .kill_terminal(&user.id, &id, &terminal_id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
 async fn cancel(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -340,6 +394,19 @@ async fn ensure_runtime(
     let response = state
         .service
         .ensure_runtime(&user.id, &id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn restart_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<EnsureConversationRuntimeResponse>>, ApiError> {
+    let response = state
+        .service
+        .restart_runtime(&user.id, &id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))
@@ -403,6 +470,51 @@ async fn confirm(
     state
         .service
         .confirm(&user.id, &params.id, &params.call_id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+#[derive(serde::Deserialize)]
+struct AskPathParams {
+    id: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
+}
+
+/// Dedicated answer channel for the structured question card (AskUserQuestion).
+/// Body: `{answers:[{question, labels[]}]}` to answer, `{decline:true}` to
+/// dismiss. Exactly one shape must be present — an empty answer set is
+/// rejected rather than forwarded (claude silently drops unanswered questions
+/// on an allow, so an "empty allow" is silent data loss).
+async fn answer_ask(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AskPathParams>,
+    body: Result<Json<aionui_api_types::AskAnswerRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let answers = if req.decline {
+        if !req.answers.is_empty() {
+            return Err(ApiError::BadRequest(
+                "decline and answers are mutually exclusive".into(),
+            ));
+        }
+        None
+    } else {
+        if req.answers.is_empty() {
+            return Err(ApiError::BadRequest(
+                "answers must not be empty unless decline is true".into(),
+            ));
+        }
+        if req.answers.iter().any(|a| a.question.trim().is_empty()) {
+            return Err(ApiError::BadRequest("every answer must name its question".into()));
+        }
+        Some(req.answers)
+    };
+    state
+        .service
+        .answer_ask(&user.id, &params.id, &params.request_id, answers, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
@@ -514,5 +626,26 @@ mod error_mapping_tests {
         let details = app.error_details().expect("details should be present");
         assert_eq!(details["backend"], "openclaw");
         assert_eq!(details["port"], 18789);
+    }
+}
+
+#[cfg(test)]
+mod route_shape_tests {
+    /// axum builds its route trie eagerly, so an overlapping registration panics
+    /// at construction, not at request time — `cargo check` would never catch it.
+    /// `/messages/latest` deliberately sits before the `{messageId}` wildcard;
+    /// this test is the guard that the pair stays registrable together.
+    #[test]
+    fn latest_message_route_coexists_with_the_message_id_wildcard() {
+        let router: axum::Router<()> = axum::Router::new()
+            .route(
+                "/api/conversations/{id}/messages/latest",
+                axum::routing::get(|| async { "latest" }),
+            )
+            .route(
+                "/api/conversations/{id}/messages/{messageId}",
+                axum::routing::get(|| async { "by-id" }),
+            );
+        let _ = router.into_make_service();
     }
 }

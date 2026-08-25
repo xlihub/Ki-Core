@@ -236,6 +236,14 @@ fn build_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Vec<Value> {
 pub fn acp_capabilities() -> Capabilities {
     Capabilities {
         tier: CapabilityTier::Parsed,
+        // ACP's schema explicitly allows `session/set_mode` "at any time during a session,
+        // whether the Agent is idle or actively generating a response"
+        // (agent-client-protocol-schema-1.5.0/src/v1/agent.rs). It says nothing about WHEN
+        // the new mode starts governing, and the `SetSessionModeResponse` is empty, so
+        // there is nothing to read either way. This path is not the one the ACP manager
+        // uses for confirmation — that one waits for an observed value — so `Immediate`
+        // here only reflects "the request is not deferred by us".
+        mode_switch_effect: crate::capability::ModeSwitchEffect::Immediate,
         emits: SignalSet {
             // ACP has no liveness heartbeat notification; the turn terminal is the
             // prompt response (no idle-timeout in AionCore anyway, post-007).
@@ -282,6 +290,7 @@ pub fn acp_capabilities() -> Capabilities {
         // 009 R2: ACP is one session/prompt at a time — no proactive next-turn
         // input path from the conv layer. can_queue degrades to false (= can_send).
         accepts_proactive_input: false,
+        supports_midturn_delivery: false,
         // #101: static default empty; filled from the `available_commands_update`
         // session/update (capabilities() merges the discovered set on read).
         slash_commands: Vec::new(),
@@ -1181,6 +1190,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
                                         localized: None,
+                                        supersedes_key: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {
@@ -1916,7 +1926,7 @@ async fn map_update(
 /// LC-8a: normalize an ACP/codex plan-step status string → canonical `PlanStatus`
 /// (I8). camelCase `inProgress` (codex) AND snake_case `in_progress` (ACP) both map
 /// to `InProgress`; unknown → `Pending` (never panic).
-fn map_plan_status(s: &str) -> crate::event::PlanStatus {
+pub(crate) fn map_plan_status(s: &str) -> crate::event::PlanStatus {
     use crate::event::PlanStatus;
     match s {
         "inProgress" | "in_progress" => PlanStatus::InProgress,
@@ -2479,6 +2489,10 @@ impl SessionBackend for AcpSessionBackend {
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
+            // ACP has no structured-question channel (elicitation unimplemented,
+            // 0/24 live agents emit it — 2026-08-04 sweep); Ask is never raised
+            // here, so an answer has nothing to land on.
+            Command::AnswerAsk { .. } => Err(BackendError::CommandNotSupported { command: "answer_ask" }),
             Command::AnswerAuth { method_id, .. } => {
                 // D2: only when the agent advertised authMethods at initialize
                 // (answer_auth cap dynamically true) do we honor this. ACP auth is a
@@ -2591,6 +2605,14 @@ mod tests {
     use super::*;
     use crate::backend::{McpServerSpec, McpTransport};
     use crate::testing::FakeAgentIo;
+
+    /// Verified backend matrix (task-1 brief): ACP MUST NOT advertise
+    /// `supports_midturn_delivery` — one `session/prompt` at a time, no
+    /// proactive mid-turn input path.
+    #[test]
+    fn capabilities_do_not_advertise_midturn_delivery() {
+        assert!(!acp_capabilities().supports_midturn_delivery);
+    }
 
     /// PROPERTY (§F.3 input field-value boundary for the acp `map_update` entry,
     /// sibling of codex `prop_map_item_*` and claude `prop_parse_assistant_*`): for

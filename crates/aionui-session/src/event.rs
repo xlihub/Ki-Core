@@ -280,6 +280,28 @@ pub enum SessionEvent {
         kind: PermissionKind,
     },
 
+    /// A structured question the agent asks the USER (claude `AskUserQuestion`
+    /// via `control_request{can_use_tool}`): its own event, deliberately NOT a
+    /// `Permission` — asking is not authorizing (2026-08-04 design ruling, spec
+    /// `docs/superpowers/specs/2026-08-04-askuserquestion-统一问询设计.md`).
+    /// Enters requires-action via its OWN counter (`waiting_on_question` +1),
+    /// answered by `Command::AnswerAsk` keyed on the same `request_id` (the
+    /// claude control correlation key). `questions` is the tool's raw
+    /// `{questions:[{question, header?, options:[{label, description?}],
+    /// multiSelect?}]}` payload — the SAME shape three independent vendors
+    /// converged on (claude 2.1.178 samples; qwen/grok live captures 2026-08-04),
+    /// so it doubles as the cross-backend contract without a re-mapping layer.
+    /// The reducer never reads it (ref-count on request_id only, §R9).
+    /// ⚠️ TIO-13: question text is user-facing card content, never log at info.
+    Ask {
+        request_id: String,
+        questions: serde_json::Value,
+    },
+    /// The matching resolve for `Ask` (symmetric with `PermissionResolved`,
+    /// counter `waiting_on_question` -1): emitted when the user answers
+    /// (`AnswerAsk`) or claude retracts via `control_cancel_request`.
+    AskResolved { request_id: String },
+
     // ======================================================================
     // ADDITIVE backend-produced / orchestration variants (007 §C2 / §9.0).
     // The reducer takes explicit no-op arms for ALL of these EXCEPT SubagentUpdate
@@ -454,6 +476,16 @@ pub enum SessionEvent {
         message: String,
         /// Optional translation handle. `None` renders `message` verbatim.
         localized: Option<LocalizedText>,
+        /// Stable identity for a notice that SUPERSEDES its predecessor.
+        ///
+        /// A progress-style notice restates the same fact with a new number
+        /// (codex retries: "Reconnecting... 1/5", then 2/5, 3/5 …). Appending
+        /// each one buries the conversation under near-identical cards, while
+        /// showing only the first hides the progress. Notices sharing a key
+        /// replace the previous one in place, so the user sees a single card
+        /// counting up. `None` = an ordinary notice, always appended.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes_key: Option<String>,
     },
 
     /// Live tool-OUTPUT delta (codex `item/commandExecution/outputDelta`). The
@@ -572,6 +604,19 @@ pub enum SessionEvent {
     /// pass-through, reducer no-op, never persisted as an event. Only codex
     /// emits it today; backends without a turn-anchored fork never do.
     BackendTurnBound { backend_turn_id: String },
+
+    /// Task 2 (mid-turn interjection observability): claude echoes back the
+    /// `uuid` WE minted on a user frame via a `command_lifecycle` frame
+    /// (`{"type":"command_lifecycle","command_uuid":"<uuid>","state":"queued"
+    /// |"started"|"completed"|"cancelled"}`, verified 2.1.226, design spec
+    /// §6.1). `client_msg_id` is that echoed uuid — the SAME correlation key
+    /// the pending-queue already tracks — so consumers need no guessing.
+    /// Reducer no-op today (no consumer yet — Task 3); this is a pure
+    /// observation of "the user message was consumed by the agent".
+    MessageLifecycle {
+        client_msg_id: String,
+        phase: MessageLifecyclePhase,
+    },
 }
 
 // ==========================================================================
@@ -627,13 +672,17 @@ pub enum SubagentKind {
 
 /// Container kind of a `SubagentUpdate` roster entry (see that variant's `kind`
 /// field). Normalized from the claude wire's `task_started.task_type`:
-/// `"local_workflow"` → `WorkflowContainer`, any other declared value (e.g.
-/// `"local_bash"`) → `Other`. Deliberately two-valued: the only consumer is the
-/// pump's suppression-roster admission, which needs exactly the bit "may this
-/// ref hold the turn open".
+/// `"local_workflow"` → `WorkflowContainer`, `"local_agent"` (a Task subagent,
+/// foreground or background — the wire declares both the same way, verified:
+/// `claude_2.1.169_single_tool_turn.ndjson`) → `AgentContainer`, any other
+/// declared value (e.g. `"local_bash"`) → `Other`. Two consumers: the pump's
+/// suppression-roster admission (WorkflowContainer alone may hold a turn open)
+/// and the background-card headline (AgentContainer renders "subagent", not
+/// "bg task", so a Task subagent is distinguishable from a background bash).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubagentTaskKind {
     WorkflowContainer,
+    AgentContainer,
     Other,
 }
 
@@ -645,6 +694,22 @@ pub enum PermissionKind {
     #[default]
     Tool,
     Auth,
+}
+
+/// Phase of a user message the CLI reports back. claude emits these as
+/// `command_lifecycle` frames echoing the `uuid` WE minted on the user frame,
+/// so correlation needs no guessing (verified 2.1.226; see the design spec
+/// §6.1). Advertised as `msg_lifecycle_v1` in `system/init` capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MessageLifecyclePhase {
+    /// Written to the CLI, not yet consumed into a turn.
+    Queued,
+    /// The agent has taken the message into a turn.
+    Started,
+    /// The turn that consumed it has finished.
+    Completed,
+    /// Dropped without being consumed.
+    Cancelled,
 }
 
 /// LC-8a: one entry in a [`SessionEvent::Plan`] to-do snapshot. Unified shape over
@@ -899,6 +964,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Plan { .. }
         | Permission { .. }
         | PermissionResolved { .. }
+        | Ask { .. }
+        | AskResolved { .. }
         | PromptAccepted { .. }
         | UsageDelta { .. }
         | Provisioning { .. }
@@ -916,7 +983,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | MessageFinalized(..)
         | SessionInfo { .. }
         | SessionTitle { .. }
-        | CheckpointList { .. } => EventClass::BackendProduced,
+        | CheckpointList { .. }
+        | MessageLifecycle { .. } => EventClass::BackendProduced,
     }
 }
 
@@ -953,6 +1021,9 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             // the phase list is re-declared on the next run's first progress frame
             WorkflowPhase { .. } => PersistTier::Ephemeral,
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)
+            // Task 2: a pure liveness/correlation signal (queued→started→completed/
+            // cancelled), re-derivable from the next turn's own frames — not history.
+            MessageLifecycle { .. } => PersistTier::Ephemeral,
             ToolCall { .. }
             | ToolResult { .. }
             | UsageDelta { .. }
@@ -965,6 +1036,9 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             Permission { .. } | PermissionResolved { .. } | Detached { .. } | PromptAccepted { .. } => {
                 PersistTier::DisplayAndState
             }
+            // same routing as Permission: the question card is history (display)
+            // AND an open-request the rebuild must re-raise (state).
+            Ask { .. } | AskResolved { .. } => PersistTier::DisplayAndState,
             SubagentUpdate { .. } => PersistTier::DisplayAndState, // roster→display; resumable→Tier2.last_subagents
             Rewound { .. } => PersistTier::State,                  // turn-truncation anchor
             AdapterSpecific { tag, .. } if is_raw_timing(tag) => PersistTier::Ephemeral,
@@ -1161,6 +1235,7 @@ mod additive_tests {
                     level: NoticeLevel::Warning,
                     message: "config key X is deprecated".into(),
                     localized: None,
+                    supersedes_key: None,
                 },
                 BackendProduced,
                 Display,
@@ -1400,16 +1475,26 @@ mod additive_tests {
             ),
             // ── backend-produced, State ──
             ("Rewound", SessionEvent::Rewound { to_turn: 1 }, BackendProduced, State),
+            // Task 2: a pure correlation/liveness signal, re-derivable — Ephemeral.
+            (
+                "MessageLifecycle",
+                SessionEvent::MessageLifecycle {
+                    client_msg_id: "u-1".into(),
+                    phase: MessageLifecyclePhase::Queued,
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 33 variants today
-        // (7 orchestration-lowered + 26 backend-produced, incl. Notice +
-        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle);
-        // AdapterSpecific appears twice for its raw-timing vs structured split
-        // → 34 rows. A new variant trips.
+        // Tripwire: every SessionEvent variant must appear. 34 variants today
+        // (7 orchestration-lowered + 27 backend-produced, incl. Notice +
+        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle +
+        // MessageLifecycle); AdapterSpecific appears twice for its raw-timing
+        // vs structured split → 35 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            34,
+            35,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 
@@ -1582,6 +1667,7 @@ mod additive_tests {
                 level: NoticeLevel::Info,
                 message: "deprecated: use --foo".into(),
                 localized: None,
+                supersedes_key: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),
@@ -1626,6 +1712,10 @@ mod additive_tests {
             SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0.1180".into()),
+            },
+            SessionEvent::MessageLifecycle {
+                client_msg_id: "u-1".into(),
+                phase: MessageLifecyclePhase::Started,
             },
         ];
         for ev in events {

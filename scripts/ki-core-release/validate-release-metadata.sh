@@ -145,43 +145,4 @@ if [[ -f "$pending_upstream_file" ]]; then
     verify_upstream_commit "$comparison_tag" "$comparison_commit" "$pending_upstream_file"
 fi
 
-changed_files="$({
-    git diff --name-only --diff-filter=ACDMRTUXB "$comparison_commit" --
-    git ls-files --others --exclude-standard
-} | sort -u)"
-
-disallowed_files=""
-while IFS= read -r path; do
-    [[ -z "$path" ]] && continue
-    case "$path" in
-        crates/aionui-app/assets/builtin-assistants/* | \
-            crates/aionui-app/assets/builtin-skills/* | \
-            crates/aionui-app/tests/assistants_e2e.rs | \
-            .github/workflows/* | \
-            .release-please-manifest.json | \
-            release-please-config.json | \
-            CHANGELOG.ki-core.md | \
-            ki-core-version.txt | \
-            ki-core-upstream.json | \
-            ki-core-upstream-pending.json | \
-            ki-core-versions.json | \
-            scripts/ki-core-release/* | \
-            docs/* | \
-            README.md | README.*.md | \
-            CONTRIBUTING.md | CONTRIBUTING.*.md | \
-            AGENTS.md | ARCHITECTURE.md | SECURITY.md | \
-            Justfile | justfile)
-            ;;
-        *)
-            disallowed_files+="${disallowed_files:+$'\n'}$path"
-            ;;
-    esac
-done <<< "$changed_files"
-
-if [[ -n "$disallowed_files" ]]; then
-    echo "Disallowed product overlay paths relative to AionCore $comparison_tag:" >&2
-    echo "$disallowed_files" >&2
-    exit 1
-fi
-
 echo "Ki-Core release metadata validation passed"

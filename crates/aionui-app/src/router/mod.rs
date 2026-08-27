@@ -2,6 +2,7 @@
 
 mod antigravity_hook;
 mod clipboard_writer;
+mod cron_mcp_snapshot_resolver;
 mod fs_monitor;
 mod health;
 mod item_revealer;

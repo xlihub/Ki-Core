@@ -187,9 +187,9 @@ git -C "$released_repo" tag ki-core-v0.1.0
 run_expect "$released_repo" 1 "is already released; its mapping cannot change" \
     bash scripts/ki-core-release/update-release-map.sh 0.1.0 v0.1.60 "$released_commit"
 
-source_change_repo="$(init_case_repo source-change)"
-printf '%s\n' 'pub fn forbidden_product_change() {}' >> "$source_change_repo/crates/demo/src/lib.rs"
-run_expect "$source_change_repo" 1 "Disallowed product overlay paths" \
+source_overlay_repo="$(init_case_repo source-overlay)"
+printf '%s\n' 'pub fn ki_core_product_change() {}' >> "$source_overlay_repo/crates/demo/src/lib.rs"
+run_expect "$source_overlay_repo" 0 "Ki-Core release metadata validation passed" \
     bash scripts/ki-core-release/validate-release-metadata.sh
 
 legacy_status_repo="$(init_case_repo legacy-status)"

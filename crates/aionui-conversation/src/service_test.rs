@@ -7707,6 +7707,34 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("preset_enabled_skills").is_none());
     assert!(resp.extra.get("exclude_auto_inject_skills").is_none());
+    assert_eq!(
+        resp.extra["capability_snapshot"],
+        json!({
+            "skill_ids": ["pdf", "cron"],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": ["todo-tracker"],
+        })
+    );
+}
+
+#[tokio::test]
+async fn create_persists_a_complete_capability_snapshot_when_extra_is_not_an_object() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let mut req = make_create_req();
+    req.extra = serde_json::Value::Null;
+
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(
+        resp.extra["capability_snapshot"],
+        json!({
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": [],
+        })
+    );
 }
 
 #[tokio::test]

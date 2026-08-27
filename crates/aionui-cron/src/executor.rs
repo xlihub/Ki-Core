@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{
+    AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
+};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
@@ -18,6 +20,7 @@ use tracing::{error, info, warn};
 
 use crate::artifacts::{broadcast_artifact, build_cron_trigger_artifact};
 use crate::error::CronError;
+use crate::mcp_snapshot::ICronMcpSnapshotResolver;
 use crate::prompt::{
     build_existing_conversation_prompt, build_new_conversation_prompt_with_skill_suggest,
     build_new_conversation_with_skill_prompt,
@@ -58,6 +61,7 @@ struct SkillSuggestContext {
 pub struct JobExecutor {
     conversation_repo: Arc<dyn IConversationRepository>,
     conversation_service: Arc<ConversationService>,
+    mcp_snapshot_resolver: Arc<dyn ICronMcpSnapshotResolver>,
     work_dir: PathBuf,
     data_dir: PathBuf,
     broadcaster: Arc<dyn EventBroadcaster>,
@@ -71,6 +75,7 @@ impl JobExecutor {
         _task_manager: Arc<dyn IWorkerTaskManager>,
         conversation_repo: Arc<dyn IConversationRepository>,
         conversation_service: Arc<ConversationService>,
+        mcp_snapshot_resolver: Arc<dyn ICronMcpSnapshotResolver>,
         work_dir: PathBuf,
         data_dir: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -81,6 +86,7 @@ impl JobExecutor {
         Self {
             conversation_repo,
             conversation_service,
+            mcp_snapshot_resolver,
             work_dir,
             data_dir,
             broadcaster,
@@ -599,7 +605,24 @@ impl JobExecutor {
         let model = resolve_model(job);
         let user_id = self.resolve_conversation_owner_user_id(job).await?;
 
-        let extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
+        let mut extra = build_conversation_extra(&self.agent_registry, job, saved_skill, purpose).await;
+        if let Some(config) = job.agent_config.as_ref() {
+            let selection = self
+                .mcp_snapshot_resolver
+                .resolve(&user_id, &config.mcp_ids)
+                .await
+                .map_err(|error| CronError::Scheduler(format!("resolve cron MCP snapshot: {error}")))?;
+            if let Some(obj) = extra.as_object_mut() {
+                obj.insert(
+                    "selected_mcp_server_ids".to_owned(),
+                    serde_json::to_value(selection.mcp_server_ids)?,
+                );
+                obj.insert(
+                    "selected_session_mcp_servers".to_owned(),
+                    serde_json::to_value(selection.session_mcp_servers)?,
+                );
+            }
+        }
         let assistant = build_assistant_request(job);
 
         let req = CreateConversationRequest {
@@ -1175,10 +1198,19 @@ fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest
                 .map(ToOwned::to_owned)
         })?;
 
+    let conversation_overrides = Some(AssistantConversationOverridesRequest {
+        model: None,
+        permission: None,
+        thought_level: None,
+        skill_ids: Some(config.skill_ids.clone()),
+        disabled_builtin_skill_ids: Some(config.disabled_builtin_skill_ids.clone()),
+        mcp_ids: Some(config.mcp_ids.clone()),
+    });
+
     Some(AssistantConversationRequest {
         id: assistant_id,
         locale: None,
-        conversation_overrides: None,
+        conversation_overrides,
     })
 }
 
@@ -1204,10 +1236,20 @@ async fn build_conversation_extra(
     let mut extra = serde_json::Map::new();
     extra.insert("cron_job_id".to_owned(), serde_json::Value::String(job.id.clone()));
     extra.insert("cronJobId".to_owned(), serde_json::Value::String(job.id.clone()));
-    if matches!(purpose, ConversationPurpose::NewConversationExecution) {
+    let mut excluded_skills = job
+        .agent_config
+        .as_ref()
+        .map(|config| config.exclude_auto_inject_skills.clone())
+        .unwrap_or_default();
+    if matches!(purpose, ConversationPurpose::NewConversationExecution)
+        && !excluded_skills.iter().any(|value| value == "cron")
+    {
+        excluded_skills.push("cron".to_owned());
+    }
+    if !excluded_skills.is_empty() {
         extra.insert(
             "exclude_auto_inject_skills".to_owned(),
-            serde_json::Value::Array(vec![serde_json::Value::String("cron".to_owned())]),
+            serde_json::Value::Array(excluded_skills.into_iter().map(serde_json::Value::String).collect()),
         );
     }
 
@@ -1308,6 +1350,7 @@ async fn persist_legacy_skill_file(data_dir: &Path, job: &CronJob, raw_content: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_snapshot::{CronMcpSnapshotError, ICronMcpSnapshotResolver, ResolvedCronMcpSnapshot};
     use crate::types::{CreatedBy, CronAgentConfig, CronSchedule};
     use aionui_ai_agent::AgentStreamEvent;
     use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
@@ -1323,6 +1366,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::sync::{RwLock, broadcast};
     use tokio::time::timeout;
+
+    struct TestCronMcpSnapshotResolver;
+
+    #[async_trait::async_trait]
+    impl ICronMcpSnapshotResolver for TestCronMcpSnapshotResolver {
+        async fn resolve(
+            &self,
+            _user_id: &str,
+            selected_ids: &[String],
+        ) -> Result<ResolvedCronMcpSnapshot, CronMcpSnapshotError> {
+            Ok(ResolvedCronMcpSnapshot {
+                mcp_server_ids: selected_ids.to_vec(),
+                session_mcp_servers: Vec::new(),
+            })
+        }
+    }
 
     fn ensure_named_workspace_path(name: &str) -> String {
         let workspace = std::env::temp_dir().join(name);
@@ -1353,6 +1412,7 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: Some(ensure_named_workspace_path("aionui-cron-sample-job-workspace")),
+                ..Default::default()
             }),
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
@@ -1716,6 +1776,7 @@ mod tests {
                 }),
                 config_options: None,
                 workspace: None,
+                ..Default::default()
             }),
             ..sample_job()
         };
@@ -1743,6 +1804,7 @@ mod tests {
                 }),
                 config_options: None,
                 workspace: None,
+                ..Default::default()
             }),
             ..sample_job()
         };
@@ -1778,6 +1840,7 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: None,
+                ..Default::default()
             }),
             ..sample_job()
         };
@@ -1935,7 +1998,61 @@ mod tests {
 
         assert_eq!(assistant.id, "custom-assistant");
         assert!(assistant.locale.is_none());
-        assert!(assistant.conversation_overrides.is_none());
+        assert!(assistant.conversation_overrides.is_some());
+    }
+
+    #[test]
+    fn build_assistant_request_preserves_capability_snapshot() {
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().expect("sample job should carry config");
+        config.skill_ids = vec!["assistant-skill".into()];
+        config.disabled_builtin_skill_ids = vec!["disabled-builtin".into()];
+        config.mcp_ids = vec!["builtin-adapter".into()];
+
+        let assistant = build_assistant_request(&job).expect("assistant request");
+        let overrides = assistant.conversation_overrides.expect("capability overrides");
+
+        assert_eq!(overrides.skill_ids, Some(vec!["assistant-skill".into()]));
+        assert_eq!(
+            overrides.disabled_builtin_skill_ids,
+            Some(vec!["disabled-builtin".into()])
+        );
+        assert_eq!(overrides.mcp_ids, Some(vec!["builtin-adapter".into()]));
+    }
+
+    #[test]
+    fn build_assistant_request_preserves_explicit_empty_capability_snapshot() {
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().expect("sample job should carry config");
+        config.skill_ids = Vec::new();
+        config.disabled_builtin_skill_ids = Vec::new();
+        config.mcp_ids = Vec::new();
+
+        let assistant = build_assistant_request(&job).expect("assistant request");
+        let overrides = assistant.conversation_overrides.expect("capability overrides");
+
+        assert_eq!(overrides.skill_ids, Some(Vec::new()));
+        assert_eq!(overrides.disabled_builtin_skill_ids, Some(Vec::new()));
+        assert_eq!(overrides.mcp_ids, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn build_conversation_extra_merges_product_and_cron_skill_exclusions() {
+        let registry = hydrated_registry().await;
+        let mut job = sample_job();
+        job.execution_mode = ExecutionMode::NewConversation;
+        job.agent_config
+            .as_mut()
+            .expect("sample job should carry config")
+            .exclude_auto_inject_skills = vec!["legacy-auto-skill".into()];
+
+        let extra =
+            build_conversation_extra(&registry, &job, None, ConversationPurpose::NewConversationExecution).await;
+
+        assert_eq!(
+            extra["exclude_auto_inject_skills"],
+            serde_json::json!(["legacy-auto-skill", "cron"])
+        );
     }
 
     #[tokio::test]
@@ -2654,6 +2771,7 @@ mod tests {
             Arc::new(StubTaskManager),
             stub_repo,
             conv_service,
+            Arc::new(TestCronMcpSnapshotResolver),
             std::env::temp_dir(),
             std::env::temp_dir(),
             Arc::new(StubBroadcaster),
@@ -3412,6 +3530,7 @@ mod tests {
             task_manager,
             repo,
             conversation_service,
+            Arc::new(TestCronMcpSnapshotResolver),
             std::env::temp_dir(),
             std::env::temp_dir(),
             broadcaster,

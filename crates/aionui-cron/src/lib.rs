@@ -5,6 +5,7 @@ mod artifacts;
 pub mod error;
 pub mod events;
 pub mod executor;
+pub mod mcp_snapshot;
 pub mod prompt;
 pub mod routes;
 pub mod scheduler;

@@ -29,7 +29,11 @@ const DEFAULT_CRON_ASSISTANT_ID: &str = "cron-e2e-assistant";
 fn default_assistant_agent_config(name: &str) -> serde_json::Value {
     json!({
         "name": name,
-        "assistant_id": DEFAULT_CRON_ASSISTANT_ID
+        "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
+        "skill_ids": [],
+        "disabled_builtin_skill_ids": [],
+        "mcp_ids": [],
+        "exclude_auto_inject_skills": []
     })
 }
 
@@ -305,6 +309,26 @@ async fn cj3_create_missing_required_fields() {
 }
 
 #[tokio::test]
+async fn cj3a_create_rejects_incomplete_capability_snapshot() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mut body = create_job_body("Incomplete Capability Snapshot");
+    body["agent_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("exclude_auto_inject_skills");
+
+    let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(body["error"], "Invalid JSON request body.");
+}
+
+#[tokio::test]
 async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
@@ -324,7 +348,11 @@ async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
         "agent_config": {
             "name": "Cron Agent",
             "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
-            "workspace": workspace.to_string_lossy()
+            "workspace": workspace.to_string_lossy(),
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": []
         }
     });
 
@@ -353,7 +381,11 @@ async fn cj3c_create_rejects_missing_workspace_path() {
         "agent_config": {
             "name": "Claude Code",
             "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
-            "workspace": "/tmp/cron-job-workspace-missing-path"
+            "workspace": "/tmp/cron-job-workspace-missing-path",
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": []
         }
     });
 
@@ -441,7 +473,11 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
                 json!({
                     "name": "Cron Agent",
                     "assistant_id": DEFAULT_CRON_ASSISTANT_ID,
-                    "workspace": workspace.to_string_lossy()
+                    "workspace": workspace.to_string_lossy(),
+                    "skill_ids": [],
+                    "disabled_builtin_skill_ids": [],
+                    "mcp_ids": [],
+                    "exclude_auto_inject_skills": []
                 })
                 .to_string(),
             ),
@@ -548,6 +584,41 @@ async fn cj8_update_job() {
     assert!(
         json["data"]["metadata"]["updated_at"].as_i64().unwrap() >= created["metadata"]["created_at"].as_i64().unwrap()
     );
+}
+
+#[tokio::test]
+async fn cj8a_update_rejects_incomplete_capability_snapshot() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let created = create_job(
+        &mut app,
+        &services,
+        &token,
+        &csrf,
+        create_job_body("Incomplete Update Snapshot"),
+    )
+    .await;
+    let job_id = created["id"].as_str().unwrap();
+    let mut agent_config = default_assistant_agent_config("Incomplete Update Snapshot");
+    agent_config
+        .as_object_mut()
+        .unwrap()
+        .remove("disabled_builtin_skill_ids");
+
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        json!({ "agent_config": agent_config }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(body["error"], "Invalid JSON request body.");
 }
 
 // ── CJ-9: Update schedule type ──────────────────────────────────────
@@ -737,22 +808,30 @@ async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
 }
 
 #[tokio::test]
-async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcps() {
+async fn rn1c_run_now_new_conversation_uses_cron_capability_snapshot() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
+    let builtin_transport_config = json!({
+        "command": std::env::current_exe()
+            .expect("resolve current test executable")
+            .to_string_lossy(),
+        "args": [],
+        "env": {}
+    })
+    .to_string();
     let fixed_mcp = mcp_repo
         .create(CreateMcpServerParams {
             user_id: "system_default_user",
             name: "fixed-mcp",
             description: None,
             enabled: true,
-            transport_type: "http",
-            transport_config: r#"{"url":"https://example.invalid/fixed"}"#,
+            transport_type: "stdio",
+            transport_config: &builtin_transport_config,
             tools: None,
             original_json: None,
-            builtin: false,
+            builtin: true,
         })
         .await
         .expect("create fixed mcp");
@@ -781,7 +860,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
             "defaults": {
                 "mcps": {
                     "mode": "fixed",
-                    "value": [fixed_mcp.id]
+                    "value": [extra_mcp.id]
                 }
             }
         }),
@@ -803,7 +882,11 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
             "execution_mode": "new_conversation",
             "agent_config": {
                 "name": "Cron MCP Assistant",
-                "assistant_id": "u-fixed-mcp"
+                "assistant_id": "u-fixed-mcp",
+                "skill_ids": ["cron-explicit-skill"],
+                "disabled_builtin_skill_ids": ["legacy-auto-skill"],
+                "mcp_ids": [fixed_mcp.id, extra_mcp.id],
+                "exclude_auto_inject_skills": ["legacy-auto-skill"]
             }
         }),
         &token,
@@ -859,8 +942,17 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
     assert!(extra.get("assistant_id").is_none());
     assert!(extra.get("preset_assistant_id").is_none());
     assert!(extra.get("custom_agent_id").is_none());
-    assert_eq!(extra["mcp_server_ids"], json!([fixed_mcp.id]));
-    assert_eq!(extra["mcp_servers"], json!(["fixed-mcp"]));
+    assert_eq!(extra["mcp_server_ids"], json!([extra_mcp.id]));
+    assert_eq!(extra["mcp_servers"], json!(["extra-mcp", "fixed-mcp"]));
+    assert_eq!(
+        extra["capability_snapshot"],
+        json!({
+            "skill_ids": ["cron-explicit-skill", saved_skill_name],
+            "disabled_builtin_skill_ids": ["legacy-auto-skill"],
+            "mcp_ids": [fixed_mcp.id, extra_mcp.id],
+            "exclude_auto_inject_skills": ["legacy-auto-skill", "cron"]
+        })
+    );
     assert!(
         extra["skills"].as_array().is_some_and(|skills| {
             skills.iter().all(|skill| skill != "cron") && skills.iter().any(|skill| skill == &saved_skill_name)
@@ -875,7 +967,236 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         .expect("load assistant snapshot")
         .expect("preset assistant cron conversation should persist snapshot");
     assert_eq!(snapshot.assistant_id, "u-fixed-mcp");
-    assert_eq!(snapshot.resolved_mcp_ids, json!([fixed_mcp.id]).to_string());
+    assert_eq!(snapshot.resolved_skill_ids, json!(["cron-explicit-skill"]).to_string());
+    assert_eq!(
+        snapshot.resolved_disabled_builtin_skill_ids,
+        json!(["legacy-auto-skill"]).to_string()
+    );
+    assert_eq!(
+        snapshot.resolved_mcp_ids,
+        json!([fixed_mcp.id, extra_mcp.id]).to_string()
+    );
+}
+
+#[tokio::test]
+async fn rn1e_update_then_run_preserves_an_explicitly_empty_capability_snapshot() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
+    let assistant_default_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: "system_default_user",
+            name: "assistant-default-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"https://example.invalid/default"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .expect("create assistant default mcp");
+
+    let create_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-empty-cron-snapshot",
+            "name": "Empty Cron Snapshot Assistant",
+            "agent_id": "8e1acf31",
+            "defaults": {
+                "skills": { "mode": "fixed", "value": ["assistant-default-skill"] },
+                "mcps": { "mode": "fixed", "value": [assistant_default_mcp.id] }
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_assistant_resp = app.clone().oneshot(create_assistant_req).await.unwrap();
+    assert_eq!(create_assistant_resp.status(), StatusCode::CREATED);
+
+    let create_job_req = json_with_token(
+        "POST",
+        "/api/cron/jobs",
+        json!({
+            "name": "Explicit Empty Snapshot Cron",
+            "schedule": { "kind": "every", "every_ms": 60000 },
+            "message": "use no assistant defaults",
+            "conversation_id": "",
+            "created_by": "user",
+            "execution_mode": "new_conversation",
+            "agent_config": {
+                "name": "Empty Cron Snapshot Assistant",
+                "assistant_id": "u-empty-cron-snapshot",
+                "skill_ids": ["assistant-default-skill"],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": [assistant_default_mcp.id],
+                "exclude_auto_inject_skills": []
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_job_resp = app.clone().oneshot(create_job_req).await.unwrap();
+    assert_eq!(create_job_resp.status(), StatusCode::CREATED);
+    let create_job_body = body_json(create_job_resp).await;
+    let job_id = create_job_body["data"]["id"].as_str().expect("cron job id");
+
+    let update_req = json_with_token(
+        "PUT",
+        &format!("/api/cron/jobs/{job_id}"),
+        json!({
+            "agent_config": {
+                "name": "Empty Cron Snapshot Assistant",
+                "assistant_id": "u-empty-cron-snapshot",
+                "skill_ids": [],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": [],
+                "exclude_auto_inject_skills": []
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let update_resp = app.clone().oneshot(update_req).await.unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let get_req = get_with_token(&format!("/api/cron/jobs/{job_id}"), &token);
+    let get_resp = app.clone().oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_body = body_json(get_resp).await;
+    let persisted_config = &get_body["data"]["metadata"]["agent_config"];
+    assert_eq!(persisted_config["skill_ids"], json!([]));
+    assert_eq!(persisted_config["disabled_builtin_skill_ids"], json!([]));
+    assert_eq!(persisted_config["mcp_ids"], json!([]));
+    assert_eq!(persisted_config["exclude_auto_inject_skills"], json!([]));
+
+    let run_req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/run"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let run_resp = app.clone().oneshot(run_req).await.unwrap();
+    assert_eq!(run_resp.status(), StatusCode::OK);
+    let run_body = body_json(run_resp).await;
+    let conversation_id = run_body["data"]["conversation_id"]
+        .as_str()
+        .expect("run-now should return created conversation id");
+
+    let conversation_repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = conversation_repo
+        .owner_user_id(conversation_id)
+        .await
+        .expect("load conversation owner")
+        .expect("conversation should have an owner");
+    let conversation = conversation_repo
+        .get(&user_id, conversation_id)
+        .await
+        .expect("load conversation")
+        .expect("conversation should exist");
+    let extra: serde_json::Value = serde_json::from_str(&conversation.extra).expect("valid conversation extra");
+    assert_eq!(extra["mcp_server_ids"], json!([]));
+    assert_eq!(extra["session_mcp_servers"], json!([]));
+    assert_eq!(extra["capability_snapshot"]["skill_ids"], json!([]));
+    assert_eq!(extra["capability_snapshot"]["disabled_builtin_skill_ids"], json!([]));
+    assert_eq!(extra["capability_snapshot"]["mcp_ids"], json!([]));
+
+    let snapshot = conversation_repo
+        .get_assistant_snapshot(&user_id, conversation_id)
+        .await
+        .expect("load assistant snapshot")
+        .expect("cron conversation should persist assistant snapshot");
+    assert_eq!(snapshot.resolved_skill_ids, "[]");
+    assert_eq!(snapshot.resolved_disabled_builtin_skill_ids, "[]");
+    assert_eq!(snapshot.resolved_mcp_ids, "[]");
+}
+
+#[tokio::test]
+async fn rn1d_run_now_rejects_a_malformed_selected_builtin_mcp() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
+    let broken_mcp = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: "system_default_user",
+            name: "broken-builtin-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "stdio",
+            transport_config: r#"{"args":[],"env":{}}"#,
+            tools: None,
+            original_json: None,
+            builtin: true,
+        })
+        .await
+        .expect("create malformed builtin mcp");
+
+    let create_assistant_req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "u-broken-cron-mcp",
+            "name": "Broken Cron MCP Assistant",
+            "agent_id": "8e1acf31"
+        }),
+        &token,
+        &csrf,
+    );
+    let create_assistant_resp = app.clone().oneshot(create_assistant_req).await.unwrap();
+    assert_eq!(create_assistant_resp.status(), StatusCode::CREATED);
+
+    let create_job_req = json_with_token(
+        "POST",
+        "/api/cron/jobs",
+        json!({
+            "name": "Broken Builtin MCP Cron",
+            "schedule": { "kind": "every", "every_ms": 60000, "description": "every minute" },
+            "message": "must not run without the selected builtin mcp",
+            "conversation_id": "",
+            "created_by": "user",
+            "execution_mode": "new_conversation",
+            "agent_config": {
+                "name": "Broken Cron MCP Assistant",
+                "assistant_id": "u-broken-cron-mcp",
+                "skill_ids": [],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": [broken_mcp.id],
+                "exclude_auto_inject_skills": []
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let create_job_resp = app.clone().oneshot(create_job_req).await.unwrap();
+    assert_eq!(create_job_resp.status(), StatusCode::CREATED);
+    let create_job_body = body_json(create_job_resp).await;
+    let job_id = create_job_body["data"]["id"].as_str().expect("cron job id");
+
+    let run_req = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{job_id}/run"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let run_resp = app.clone().oneshot(run_req).await.unwrap();
+    assert_eq!(run_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let get_req = get_with_token(&format!("/api/cron/jobs/{job_id}"), &token);
+    let get_resp = app.oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let job_body = body_json(get_resp).await;
+    assert_eq!(job_body["data"]["state"]["last_status"], "error");
+    assert!(
+        job_body["data"]["state"]["last_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("broken-builtin-mcp"))
+    );
 }
 
 #[tokio::test]
@@ -1187,7 +1508,14 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
         "message": "x",
         "conversation_id": "conv_cross_acct",
         "created_by": "user",
-        "agent_config": { "name": "Steal A's Conversation", "assistant_id": "cron-e2e-assistant-b" }
+        "agent_config": {
+            "name": "Steal A's Conversation",
+            "assistant_id": "cron-e2e-assistant-b",
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": []
+        }
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token_b, &csrf_b);
     let resp = app.clone().oneshot(req).await.unwrap();

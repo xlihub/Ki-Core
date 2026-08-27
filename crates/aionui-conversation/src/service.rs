@@ -16,9 +16,10 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
-    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
+    AssistantMcpBindingChanged, CONVERSATION_CAPABILITY_SNAPSHOT_EXTRA_KEY, CancelConversationResponse,
+    CloneConversationRequest, ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
+    ConversationCapabilitySnapshot, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
     ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
@@ -1264,7 +1265,7 @@ impl ConversationService {
             merged
         }
 
-        let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
+        let (preset_enabled, disabled_builtin_skill_ids, requested_exclude_auto_inject) = match extra.as_object_mut() {
             Some(obj) => {
                 let extra_preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
                 let extra_exclude = take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"]);
@@ -1274,13 +1275,16 @@ impl ConversationService {
                 match assistant_snapshot.as_ref() {
                     Some(snapshot) => (
                         merge_string_lists(&snapshot.resolved_defaults.skill_ids, &extra_preset),
-                        merge_string_lists(&snapshot.resolved_defaults.disabled_builtin_skill_ids, &extra_exclude),
+                        snapshot.resolved_defaults.disabled_builtin_skill_ids.clone(),
+                        extra_exclude,
                     ),
-                    None => (extra_preset, extra_exclude),
+                    None => (extra_preset, Vec::new(), extra_exclude),
                 }
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
+
+        let exclude_auto_inject = merge_string_lists(&disabled_builtin_skill_ids, &requested_exclude_auto_inject);
 
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
@@ -1373,6 +1377,34 @@ impl ConversationService {
         } else {
             Vec::new()
         };
+        let session_mcp_ids = selected_session_mcp_servers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
+        let assistant_mcp_ids = assistant_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.resolved_defaults.mcp_ids.as_slice())
+            .unwrap_or(&[]);
+        let capability_mcp_ids =
+            merge_string_lists(assistant_mcp_ids, selected_mcp_server_ids.as_deref().unwrap_or(&[]));
+        let capability_mcp_ids = merge_string_lists(&capability_mcp_ids, &session_mcp_ids);
+
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert(
+                CONVERSATION_CAPABILITY_SNAPSHOT_EXTRA_KEY.to_owned(),
+                serde_json::to_value(ConversationCapabilitySnapshot {
+                    skill_ids: preset_enabled.clone(),
+                    disabled_builtin_skill_ids,
+                    mcp_ids: capability_mcp_ids,
+                    exclude_auto_inject_skills: requested_exclude_auto_inject,
+                })
+                .map_err(|error| {
+                    ConversationError::internal(format!("Failed to serialize capability snapshot: {error}"))
+                })?,
+            );
+        }
 
         let mcp_snapshot = self
             .build_runtime_mcp_snapshot(
@@ -5515,6 +5547,18 @@ impl ConversationService {
             preference.as_ref().map(|row| row.last_mcp_ids.as_str()),
         )?;
 
+        self.resolve_mcp_selection_for_ids(user_id, &selected_ids)
+            .await
+            .map(Some)
+    }
+
+    /// Resolve persisted MCP ids into database-backed ids and session-scoped
+    /// builtin server snapshots for a new conversation.
+    pub async fn resolve_mcp_selection_for_ids(
+        &self,
+        user_id: &str,
+        selected_ids: &[String],
+    ) -> Result<TeamMcpSelection, ConversationError> {
         let repo = {
             let guard = self
                 .mcp_server_repo
@@ -5526,7 +5570,7 @@ impl ConversationService {
                 .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?
         };
         let rows = repo
-            .list_by_ids_any(user_id, &selected_ids)
+            .list_by_ids_any(user_id, selected_ids)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
         let mut rows_by_id = rows
@@ -5536,7 +5580,7 @@ impl ConversationService {
         let mut mcp_server_ids = Vec::new();
         let mut session_mcp_servers = Vec::new();
         let mut mcp_statuses = Vec::new();
-        for id in &selected_ids {
+        for id in selected_ids {
             let Some(row) = rows_by_id.remove(id) else {
                 continue;
             };
@@ -5557,12 +5601,12 @@ impl ConversationService {
                 mcp_server_ids.push(row.id);
             }
         }
-        Ok(Some(TeamMcpSelection {
-            selected_ids,
+        Ok(TeamMcpSelection {
+            selected_ids: selected_ids.to_vec(),
             mcp_server_ids,
             session_mcp_servers,
             mcp_statuses,
-        }))
+        })
     }
 
     /// Resolve and classify one assistant's current MCP binding for an existing

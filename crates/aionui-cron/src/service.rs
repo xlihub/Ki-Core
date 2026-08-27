@@ -114,7 +114,7 @@ impl CronService {
 
         let conversation_title = Some(row.name.clone());
         let (agent_type, agent_config, assistant_backend_override) =
-            self.build_agent_config_from_conversation(&row).await;
+            self.build_agent_config_from_conversation(&row).await?;
         let create_req = CreateCronJobRequest {
             name: req.name,
             description: None,
@@ -629,10 +629,17 @@ impl CronService {
             }
         };
 
+        let owner_user_id = row.user_id.clone();
         let mut job = match cron_job_from_row(row) {
             Ok(j) => j,
             Err(e) => {
                 error!(job_id, error = %e, "Tick: failed to parse job");
+                let error = persisted_job_parse_error(e);
+                let message = error.to_string();
+                self.scheduler.cancel_job(job_id);
+                self.update_job_after_error(&owner_user_id, job_id, &message).await;
+                self.emitter
+                    .emit_job_executed(&owner_user_id, job_id, "error", Some(&message));
                 return;
             }
         };
@@ -793,12 +800,28 @@ impl CronService {
             .get_by_id_for_user(user_id, job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
-        let mut job = cron_job_from_row(row)?;
+        let mut job = match cron_job_from_row(row) {
+            Ok(job) => job,
+            Err(error) => {
+                error!(job_id, error = %error, "Run-now: failed to parse persisted job");
+                let error = persisted_job_parse_error(error);
+                let message = error.to_string();
+                self.update_job_after_error(user_id, job_id, &message).await;
+                self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
+                return Err(error);
+            }
+        };
         job.agent_type = self.resolve_job_agent_type(&job).await?;
-        let prepared = match self.executor.prepare_run_now(&job).await? {
-            PreparedRunNow::Ready(prepared) => prepared,
-            PreparedRunNow::AlreadyRunning { conversation_id } => {
+        let prepared = match self.executor.prepare_run_now(&job).await {
+            Ok(PreparedRunNow::Ready(prepared)) => prepared,
+            Ok(PreparedRunNow::AlreadyRunning { conversation_id }) => {
                 return Ok(RunNowResponse { conversation_id });
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.update_job_after_error(user_id, job_id, &message).await;
+                self.emitter.emit_job_executed(user_id, job_id, "error", Some(&message));
+                return Err(error);
             }
         };
         self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
@@ -1693,12 +1716,26 @@ impl CronService {
     async fn build_agent_config_from_conversation(
         &self,
         row: &aionui_db::models::ConversationRow,
-    ) -> (
-        String,
-        Option<aionui_api_types::CronAgentConfigWriteDto>,
-        Option<String>,
-    ) {
+    ) -> Result<
+        (
+            String,
+            Option<aionui_api_types::CronAgentConfigWriteDto>,
+            Option<String>,
+        ),
+        CronError,
+    > {
         let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let capability_snapshot = extra
+            .get(aionui_api_types::CONVERSATION_CAPABILITY_SNAPSHOT_EXTRA_KEY)
+            .cloned()
+            .ok_or_else(|| {
+                CronError::InvalidAgentConfig("conversation capability snapshot is required for cron creation".into())
+            })
+            .and_then(|value| {
+                serde_json::from_value::<aionui_api_types::ConversationCapabilitySnapshot>(value).map_err(|error| {
+                    CronError::InvalidAgentConfig(format!("conversation capability snapshot is invalid: {error}"))
+                })
+            })?;
         let assistant_snapshot = match self.executor.get_assistant_snapshot(&row.id).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
@@ -1870,9 +1907,13 @@ impl CronService {
             model: (row.r#type == "aionrs").then(|| model.cloned()).flatten(),
             config_options: None,
             workspace: get_string(&extra, &["workspace"]),
+            skill_ids: capability_snapshot.skill_ids,
+            disabled_builtin_skill_ids: capability_snapshot.disabled_builtin_skill_ids,
+            mcp_ids: capability_snapshot.mcp_ids,
+            exclude_auto_inject_skills: capability_snapshot.exclude_auto_inject_skills,
         };
 
-        (row.r#type.clone(), Some(agent_config), snapshot_backend)
+        Ok((row.r#type.clone(), Some(agent_config), snapshot_backend))
     }
 
     async fn build_cron_agent_config(
@@ -1917,6 +1958,10 @@ impl CronService {
             model: normalize_model(config.model, runtime_agent_type)?,
             config_options: config.config_options,
             workspace: config.workspace,
+            skill_ids: config.skill_ids,
+            disabled_builtin_skill_ids: config.disabled_builtin_skill_ids,
+            mcp_ids: config.mcp_ids,
+            exclude_auto_inject_skills: config.exclude_auto_inject_skills,
         })
     }
 
@@ -2081,6 +2126,13 @@ impl CronService {
         };
 
         Ok(rows.into_iter().find(|row| row.id == binding.agent_id))
+    }
+}
+
+fn persisted_job_parse_error(error: CronError) -> CronError {
+    match error {
+        CronError::Json(_) => CronError::InvalidAgentConfig("persisted cron agent config is invalid".into()),
+        other => other,
     }
 }
 
@@ -2312,7 +2364,22 @@ fn sanitize_agent_config_dto(
             *value = trimmed;
         }
     }
+    config.skill_ids = sanitize_string_list(config.skill_ids);
+    config.disabled_builtin_skill_ids = sanitize_string_list(config.disabled_builtin_skill_ids);
+    config.mcp_ids = sanitize_string_list(config.mcp_ids);
+    config.exclude_auto_inject_skills = sanitize_string_list(config.exclude_auto_inject_skills);
     config
+}
+
+fn sanitize_string_list(values: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    for value in values {
+        let value = value.trim().to_owned();
+        if !value.is_empty() && !sanitized.contains(&value) {
+            sanitized.push(value);
+        }
+    }
+    sanitized
 }
 
 fn schedule_from_dto_with_existing_timezone(dto: &CronScheduleDto, existing: &CronSchedule) -> CronSchedule {
@@ -2487,6 +2554,7 @@ mod tests {
             }),
             config_options: None,
             workspace: None,
+            ..Default::default()
         }
     }
 
@@ -2535,6 +2603,7 @@ mod tests {
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         };
 
         let sanitized = sanitize_agent_config_dto(config);
@@ -2693,6 +2762,7 @@ mod tests {
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         });
         let req = UpdateCronJobRequest {
             name: None,
@@ -2710,6 +2780,7 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: None,
+                ..Default::default()
             }),
             conversation_title: None,
             max_retries: None,

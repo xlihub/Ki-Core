@@ -54,6 +54,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::cron_mcp_snapshot_resolver::CronMcpSnapshotResolver;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
@@ -998,11 +999,14 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
     // second BackgroundStreamWatcher on the same agent broadcast channel and
     // every CLI-initiated (orphan) turn would be persisted twice.
     let conv_service = services.conversation_service.clone();
+    let conv_service_for_executor = Arc::new(conv_service.clone());
+    let mcp_snapshot_resolver = Arc::new(CronMcpSnapshotResolver::new(Arc::clone(&conv_service_for_executor)));
 
     let executor = Arc::new(aionui_cron::executor::JobExecutor::new(
         services.worker_task_manager.clone(),
-        conv_service.conversation_repo().clone(),
-        Arc::new(conv_service.clone()),
+        conv_service_for_executor.conversation_repo().clone(),
+        conv_service_for_executor,
+        mcp_snapshot_resolver,
         services.work_dir.clone(),
         services.data_dir.clone(),
         services.event_bus.clone(),

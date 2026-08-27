@@ -123,7 +123,7 @@ impl FromStr for JobStatus {
 // Agent configuration (domain model)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CronAgentConfig {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +144,10 @@ pub struct CronAgentConfig {
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    pub skill_ids: Vec<String>,
+    pub disabled_builtin_skill_ids: Vec<String>,
+    pub mcp_ids: Vec<String>,
+    pub exclude_auto_inject_skills: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +357,10 @@ pub fn cron_job_to_response(job: &CronJob) -> CronJobResponse {
             model: c.model.clone(),
             config_options: c.config_options.clone(),
             workspace: c.workspace.clone(),
+            skill_ids: c.skill_ids.clone(),
+            disabled_builtin_skill_ids: c.disabled_builtin_skill_ids.clone(),
+            mcp_ids: c.mcp_ids.clone(),
+            exclude_auto_inject_skills: c.exclude_auto_inject_skills.clone(),
         }
     });
 
@@ -568,7 +576,10 @@ mod tests {
             schedule_description: Some("every minute".into()),
             payload_message: "do something".into(),
             execution_mode: "existing".into(),
-            agent_config: Some(r#"{"backend":"acp","name":"Claude"}"#.into()),
+            agent_config: Some(
+                r#"{"backend":"acp","name":"Claude","skill_ids":[],"disabled_builtin_skill_ids":[],"mcp_ids":[],"exclude_auto_inject_skills":[]}"#
+                    .into(),
+            ),
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
             created_by: "user".into(),
@@ -610,6 +621,7 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: None,
+                ..Default::default()
             }),
             conversation_id: "conv_1".into(),
             conversation_title: Some("Test Conv".into()),
@@ -843,6 +855,7 @@ mod tests {
                 model: None,
                 config_options: Some(HashMap::from([("sandbox_mode".into(), "workspace-write".into())])),
                 workspace: Some("/tmp/project".into()),
+                ..Default::default()
             }),
             ..sample_job()
         };
@@ -890,6 +903,7 @@ mod tests {
                 model: None,
                 config_options: None,
                 workspace: Some("/tmp/project".into()),
+                ..Default::default()
             }),
             ..sample_job()
         };
@@ -921,6 +935,7 @@ mod tests {
                 }),
                 config_options: None,
                 workspace: Some("/tmp/project".into()),
+                ..Default::default()
             }),
             ..sample_job()
         };

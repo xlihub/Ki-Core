@@ -10,8 +10,9 @@ The published AionCore baseline is stored in
 recorded in [`ki-core-versions.json`](ki-core-versions.json). A sync PR records
 its selected baseline in `ki-core-upstream-pending.json`; the Release Please PR
 promotes that file to the published baseline and updates the version history.
-Runtime source and Cargo versions continue to follow the selected AionCore
-release.
+The selected AionCore release records Ki-Core's upstream baseline and source
+provenance. Ki-Core may maintain independent runtime, Cargo, and test changes
+on top of that baseline; those changes are versioned and released as Ki-Core.
 
 ## Release PR machine contract
 

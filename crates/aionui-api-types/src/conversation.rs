@@ -8,6 +8,17 @@ use crate::acp::AcpConfigOptionDto;
 use crate::agent_build_extra::SessionMcpServer;
 use crate::chat_file::ChatFileRef;
 
+pub const CONVERSATION_CAPABILITY_SNAPSHOT_EXTRA_KEY: &str = "capability_snapshot";
+
+/// Complete capability selection frozen when a conversation is created.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationCapabilitySnapshot {
+    pub skill_ids: Vec<String>,
+    pub disabled_builtin_skill_ids: Vec<String>,
+    pub mcp_ids: Vec<String>,
+    pub exclude_auto_inject_skills: Vec<String>,
+}
+
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

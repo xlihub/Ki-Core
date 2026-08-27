@@ -7,16 +7,16 @@
 //! Covers test-plan items: CJ-1..CJ-12, SK-1..SK-7, SC-1..SC-8,
 //! OC-1, SR-1, conversation helper API integration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::agent_task::AgentInstance;
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{
-    ApiResponse, CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
-    CronScheduleDto, ListCronJobsQuery, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
-    WebSocketMessage,
+    ApiResponse, AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationCronRequest,
+    CreateConversationCronResponse, CreateConversationRequest, CreateCronJobRequest, CronJobResponse, CronScheduleDto,
+    ListCronJobsQuery, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest, WebSocketMessage,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{PaginatedResult, ProviderWithModel, TimestampMs, now_ms};
@@ -28,8 +28,9 @@ use aionui_db::{
     IConversationRepository, ICronRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteConversationRepository,
-    SqliteCronRepository, SqliteSkillRepository, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
+    SqliteCronRepository, SqliteSkillRepository, UpdateCronJobParams, UpsertAgentMetadataParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertConversationAssistantSnapshotParams,
+    init_database_memory,
     models::{ConversationAssistantSnapshotRow, CronJobRow, MessageRow},
 };
 use aionui_realtime::EventBroadcaster;
@@ -39,6 +40,7 @@ use axum::http::{Method, Request, StatusCode};
 
 use aionui_cron::events::CronEventEmitter;
 use aionui_cron::executor::JobExecutor;
+use aionui_cron::mcp_snapshot::{CronMcpSnapshotError, ICronMcpSnapshotResolver, ResolvedCronMcpSnapshot};
 use aionui_cron::scheduler::CronScheduler;
 use aionui_cron::service::{CronService, CronServiceDeps};
 use aionui_cron::types::CronAgentConfig;
@@ -53,6 +55,22 @@ fn current_user(id: &str) -> CurrentUser {
         username: id.to_owned(),
         user_type: aionui_db::UserType::Local,
         status: aionui_db::UserStatus::Active,
+    }
+}
+
+struct TestCronMcpSnapshotResolver;
+
+#[async_trait::async_trait]
+impl ICronMcpSnapshotResolver for TestCronMcpSnapshotResolver {
+    async fn resolve(
+        &self,
+        _user_id: &str,
+        selected_ids: &[String],
+    ) -> Result<ResolvedCronMcpSnapshot, CronMcpSnapshotError> {
+        Ok(ResolvedCronMcpSnapshot {
+            mcp_server_ids: selected_ids.to_vec(),
+            session_mcp_servers: Vec::new(),
+        })
     }
 }
 
@@ -76,7 +94,7 @@ async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &
             status: Some("pending".to_owned()),
             source: None,
             channel_chat_id: None,
-            extra: "{}".to_owned(),
+            extra: empty_capability_snapshot_extra("{}"),
             pinned: false,
             pinned_at: None,
             created_at: 0,
@@ -88,6 +106,23 @@ async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &
         .await
         .unwrap();
     }
+}
+
+fn empty_capability_snapshot_extra(extra: &str) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(extra).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry(aionui_api_types::CONVERSATION_CAPABILITY_SNAPSHOT_EXTRA_KEY)
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "skill_ids": [],
+                    "disabled_builtin_skill_ids": [],
+                    "mcp_ids": [],
+                    "exclude_auto_inject_skills": []
+                })
+            });
+    }
+    value.to_string()
 }
 
 fn ensure_named_workspace_path(name: &str) -> String {
@@ -156,6 +191,7 @@ struct StubConvRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<aionui_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, aionui_db::models::ConversationRow>>,
+    raw_extra_conversation_ids: Mutex<HashSet<String>>,
     assistant_snapshots: Mutex<HashMap<String, ConversationAssistantSnapshotRow>>,
     update_failures: Mutex<Vec<String>>,
     sqlite_pool: aionui_db::SqlitePool,
@@ -167,6 +203,7 @@ impl StubConvRepo {
             messages: Mutex::new(Vec::new()),
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
+            raw_extra_conversation_ids: Mutex::new(HashSet::new()),
             assistant_snapshots: Mutex::new(HashMap::new()),
             update_failures: Mutex::new(Vec::new()),
             sqlite_pool,
@@ -208,6 +245,7 @@ impl StubConvRepo {
     }
 
     fn set_conversation_extra(&self, conversation_id: &str, extra: serde_json::Value) {
+        self.raw_extra_conversation_ids.lock().unwrap().remove(conversation_id);
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .entry(conversation_id.to_owned())
@@ -231,6 +269,14 @@ impl StubConvRepo {
             });
         row.extra = extra.to_string();
     }
+
+    fn set_raw_conversation_extra(&self, conversation_id: &str, extra: serde_json::Value) {
+        self.set_conversation_extra(conversation_id, extra);
+        self.raw_extra_conversation_ids
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_owned());
+    }
 }
 
 #[async_trait::async_trait]
@@ -240,9 +286,13 @@ impl IConversationRepository for StubConvRepo {
         user_id: &str,
         id: &str,
     ) -> Result<Option<aionui_db::models::ConversationRow>, aionui_db::DbError> {
-        if let Some(existing) = { self.rows.lock().unwrap().get(id).cloned() } {
+        if let Some(mut existing) = { self.rows.lock().unwrap().get(id).cloned() } {
             if existing.user_id != user_id {
                 return Ok(None);
+            }
+            if !self.raw_extra_conversation_ids.lock().unwrap().contains(id) {
+                existing.extra = empty_capability_snapshot_extra(&existing.extra);
+                self.rows.lock().unwrap().insert(id.to_owned(), existing.clone());
             }
             self.seed_sqlite_row(&existing).await?;
             return Ok(Some(existing));
@@ -251,7 +301,7 @@ impl IConversationRepository for StubConvRepo {
             return Ok(None);
         }
 
-        let row = if id == "conv_mode" {
+        let mut row = if id == "conv_mode" {
             aionui_db::models::ConversationRow {
                 id: id.into(),
                 user_id: "u1".into(),
@@ -578,6 +628,7 @@ impl IConversationRepository for StubConvRepo {
             }
         };
 
+        row.extra = empty_capability_snapshot_extra(&row.extra);
         if row.user_id != user_id {
             return Ok(None);
         }
@@ -639,6 +690,7 @@ impl IConversationRepository for StubConvRepo {
     }
 
     async fn create(&self, row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
+        self.seed_sqlite_row(row).await?;
         self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
         Ok(())
     }
@@ -957,6 +1009,7 @@ async fn setup_with_conv_runtime_and_agent_metadata() -> (
         task_manager,
         stub_conv_repo_trait,
         conv_service.clone(),
+        Arc::new(TestCronMcpSnapshotResolver),
         data_dir.clone(),
         data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,
@@ -1075,6 +1128,7 @@ async fn setup_with_assistant_repos() -> (
         task_manager,
         stub_conv_repo_trait,
         conv_service,
+        Arc::new(TestCronMcpSnapshotResolver),
         data_dir.clone(),
         data_dir.clone(),
         bc.clone() as Arc<dyn EventBroadcaster>,
@@ -1136,6 +1190,7 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         }),
     }
 }
@@ -1165,6 +1220,7 @@ fn make_cron_row_with_workspace(id: &str, user_id: &str, conversation_id: &str, 
                 model: None,
                 config_options: None,
                 workspace: Some(workspace.into()),
+                ..Default::default()
             })
             .unwrap(),
         ),
@@ -1277,6 +1333,26 @@ fn every_60s() -> CronScheduleDto {
     }
 }
 
+async fn persist_incomplete_capability_snapshot(cron_repo: &dyn ICronRepository, user_id: &str, job_id: &str) {
+    let row = cron_repo.get_by_id_system(job_id).await.unwrap().unwrap();
+    let mut agent_config: serde_json::Value = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
+    agent_config
+        .as_object_mut()
+        .unwrap()
+        .remove("exclude_auto_inject_skills");
+    cron_repo
+        .update_for_user(
+            user_id,
+            job_id,
+            &UpdateCronJobParams {
+                agent_config: Some(Some(agent_config.to_string())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
 fn at_future(offset_ms: i64) -> CronScheduleDto {
     CronScheduleDto::At {
         at_ms: now_ms() + offset_ms,
@@ -1326,6 +1402,65 @@ async fn create_job_allows_missing_task_description() {
 }
 
 #[tokio::test]
+async fn create_and_update_job_preserve_complete_capability_snapshot() {
+    let (svc, _, _) = setup().await;
+    let mut create_req = make_create_req("Capability Snapshot", every_60s());
+    create_req.execution_mode = Some("new_conversation".into());
+    let config = create_req.agent_config.as_mut().expect("agent config");
+    config.skill_ids = vec!["skill-a".into()];
+    config.disabled_builtin_skill_ids = vec!["builtin-skill-a".into()];
+    config.mcp_ids = vec!["mcp-a".into()];
+    config.exclude_auto_inject_skills = vec!["auto-skill-a".into()];
+
+    let created = svc.add_job("u1", create_req).await.unwrap();
+    let created_config = created.agent_config.expect("created agent config");
+    assert_eq!(created_config.skill_ids, vec!["skill-a"]);
+    assert_eq!(created_config.disabled_builtin_skill_ids, vec!["builtin-skill-a"]);
+    assert_eq!(created_config.mcp_ids, vec!["mcp-a"]);
+    assert_eq!(created_config.exclude_auto_inject_skills, vec!["auto-skill-a"]);
+
+    let updated = svc
+        .update_job(
+            "u1",
+            &created.id,
+            UpdateCronJobRequest {
+                name: None,
+                description: None,
+                enabled: None,
+                schedule: None,
+                message: None,
+                execution_mode: Some("new_conversation".into()),
+                agent_config: Some(aionui_api_types::CronAgentConfigWriteDto {
+                    name: "Default Assistant".into(),
+                    assistant_id: Some("assistant-default".into()),
+                    skill_ids: Vec::new(),
+                    disabled_builtin_skill_ids: Vec::new(),
+                    mcp_ids: Vec::new(),
+                    exclude_auto_inject_skills: Vec::new(),
+                    ..Default::default()
+                }),
+                conversation_title: None,
+                max_retries: None,
+                queue_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+    let updated_config = updated.agent_config.expect("updated agent config");
+    assert!(updated_config.skill_ids.is_empty());
+    assert!(updated_config.disabled_builtin_skill_ids.is_empty());
+    assert!(updated_config.mcp_ids.is_empty());
+    assert!(updated_config.exclude_auto_inject_skills.is_empty());
+
+    let persisted = svc.get_job("u1", &created.id).await.unwrap();
+    let persisted_config = persisted.agent_config.expect("persisted agent config");
+    assert!(persisted_config.skill_ids.is_empty());
+    assert!(persisted_config.disabled_builtin_skill_ids.is_empty());
+    assert!(persisted_config.mcp_ids.is_empty());
+    assert!(persisted_config.exclude_auto_inject_skills.is_empty());
+}
+
+#[tokio::test]
 async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
     let (svc, _, _, _, definition_repo, _) = setup_with_assistant_repos().await;
     seed_assistant_definition(&definition_repo, "asstdef_assistant_1", "assistant-1", "claude").await;
@@ -1339,6 +1474,7 @@ async fn create_job_strips_legacy_agent_ids_when_assistant_id_present() {
         model: None,
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let job = svc.add_job("u1", req).await.unwrap();
@@ -1375,6 +1511,7 @@ async fn create_job_derives_assistant_runtime_without_backend_hint() {
         model: None,
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let job = svc.add_job("u1", req).await.unwrap();
@@ -1412,6 +1549,7 @@ async fn create_job_derives_runtime_type_from_aionrs_assistant() {
         }),
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let job = svc.add_job("u1", req).await.unwrap();
@@ -1445,6 +1583,7 @@ async fn create_job_derives_runtime_type_from_assistant_overlay_override() {
         }),
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let job = svc.add_job("u1", req).await.unwrap();
@@ -1467,6 +1606,7 @@ async fn create_job_allows_assistant_backed_acp_jobs_without_backend_hint() {
         model: None,
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let job = svc.add_job("u1", req).await.unwrap();
@@ -1490,6 +1630,7 @@ async fn create_job_rejects_backend_fallback_when_assistant_id_cannot_resolve() 
         model: None,
         config_options: None,
         workspace: None,
+        ..Default::default()
     });
 
     let err = svc
@@ -1586,7 +1727,11 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
                 serde_json::json!({
                     "name": "Legacy assistant",
                     "custom_agent_id": "assistant-default",
-                    "is_preset": true
+                    "is_preset": true,
+                    "skill_ids": [],
+                    "disabled_builtin_skill_ids": [],
+                    "mcp_ids": [],
+                    "exclude_auto_inject_skills": []
                 })
                 .to_string(),
             ),
@@ -1724,6 +1869,7 @@ async fn update_existing_conversation_job_rejects_agent_config_changes() {
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         }),
         conversation_title: None,
         max_retries: None,
@@ -1763,6 +1909,7 @@ async fn update_existing_conversation_job_rejects_agent_config_even_when_switchi
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         }),
         conversation_title: None,
         max_retries: None,
@@ -1974,6 +2121,7 @@ async fn update_job_strips_legacy_agent_ids_when_assistant_id_present() {
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         }),
         conversation_title: None,
         max_retries: None,
@@ -2011,6 +2159,7 @@ async fn update_job_rejects_when_assistant_id_cannot_resolve() {
             model: None,
             config_options: None,
             workspace: None,
+            ..Default::default()
         }),
         conversation_title: None,
         max_retries: None,
@@ -2632,6 +2781,60 @@ async fn existing_job_with_missing_conversation_is_rejected() {
 }
 
 #[tokio::test]
+async fn run_now_records_invalid_persisted_capability_snapshot_as_error() {
+    let (svc, cron_repo, bc) = setup().await;
+    let job = svc
+        .add_job("u1", make_create_req("Invalid Persisted Snapshot", every_60s()))
+        .await
+        .unwrap();
+    bc.take_events();
+    persist_incomplete_capability_snapshot(cron_repo.as_ref(), "u1", &job.id).await;
+
+    let error = svc.run_now("u1", &job.id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        aionui_cron::error::CronError::InvalidAgentConfig(message)
+            if message == "persisted cron agent config is invalid"
+    ));
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.last_status.as_deref(), row.last_error.as_deref(), row.run_count),
+        (
+            Some("error"),
+            Some("Invalid agent config: persisted cron agent config is invalid"),
+            1,
+        )
+    );
+    assert!(bc.take_events().iter().any(|event| event.name == "cron.job-executed"));
+}
+
+#[tokio::test]
+async fn tick_records_invalid_persisted_capability_snapshot_without_executing() {
+    let (svc, cron_repo, bc, conv_repo, _) = setup_with_conv_runtime().await;
+    let job = svc
+        .add_job("u1", make_create_req("Invalid Scheduled Snapshot", every_60s()))
+        .await
+        .unwrap();
+    bc.take_events();
+    persist_incomplete_capability_snapshot(cron_repo.as_ref(), "u1", &job.id).await;
+
+    svc.tick(&job.id, job.next_run_at.unwrap()).await;
+
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.last_status.as_deref(), row.last_error.as_deref(), row.run_count),
+        (
+            Some("error"),
+            Some("Invalid agent config: persisted cron agent config is invalid"),
+            1,
+        )
+    );
+    assert!(conv_repo.take_messages().is_empty());
+    assert!(bc.take_events().iter().any(|event| event.name == "cron.job-executed"));
+}
+
+#[tokio::test]
 async fn run_now_on_running_existing_conversation_returns_active_conversation_without_new_execution() {
     let (svc, cron_repo, bc, _conv_repo, conv_service) = setup_with_conv_runtime().await;
 
@@ -2727,6 +2930,162 @@ async fn create_for_conversation_helper_creates_claimed_conversation_job_with_mu
     let linked = conv_repo.list_by_cron_job("u1", &response.job_id).await.unwrap();
     assert_eq!(linked.len(), 1);
     assert_eq!(linked[0].id, "conv_1");
+}
+
+#[tokio::test]
+async fn conversation_cron_route_copies_the_real_conversation_capability_snapshot() {
+    let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
+    let conversation = conv_service
+        .create(
+            "u1",
+            CreateConversationRequest {
+                r#type: None,
+                name: Some("Snapshot Source".into()),
+                model: None,
+                assistant: Some(AssistantConversationRequest {
+                    id: "assistant-default".into(),
+                    locale: None,
+                    conversation_overrides: Some(AssistantConversationOverridesRequest {
+                        model: None,
+                        permission: None,
+                        thought_level: None,
+                        skill_ids: Some(vec!["assistant-skill".into()]),
+                        disabled_builtin_skill_ids: Some(vec!["disabled-builtin".into()]),
+                        mcp_ids: Some(vec!["assistant-mcp".into()]),
+                    }),
+                }),
+                source: None,
+                channel_chat_id: None,
+                extra: serde_json::json!({"exclude_auto_inject_skills": ["legacy-auto-skill"]}),
+            },
+        )
+        .await
+        .unwrap();
+    let _claim = conv_service
+        .runtime_state()
+        .try_claim_turn(&conversation.id, "turn_helper_snapshot")
+        .expect("claim conversation");
+
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    })
+    .layer(Extension(current_user("u1")));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", &conversation.id)
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("use the same capabilities")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let envelope: ApiResponse<CreateConversationCronResponse> = serde_json::from_slice(&body).unwrap();
+    let response = envelope.data.expect("response should contain created job id");
+
+    let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
+    let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
+    assert_eq!(config.skill_ids, vec!["assistant-skill"]);
+    assert_eq!(config.disabled_builtin_skill_ids, vec!["disabled-builtin"]);
+    assert_eq!(config.mcp_ids, vec!["assistant-mcp"]);
+    assert_eq!(config.exclude_auto_inject_skills, vec!["legacy-auto-skill"]);
+}
+
+#[tokio::test]
+async fn conversation_cron_route_rejects_missing_capability_snapshot() {
+    let (svc, _, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    conv_repo.set_raw_conversation_extra("conv_1", serde_json::json!({}));
+    let _claim = conv_service
+        .runtime_state()
+        .try_claim_turn("conv_1", "turn_helper_missing_snapshot")
+        .expect("claim conversation");
+
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    })
+    .layer(Extension(current_user("u1")));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("create without snapshot")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(
+        body["error"],
+        "conversation capability snapshot is required for cron creation"
+    );
+}
+
+#[tokio::test]
+async fn conversation_cron_route_rejects_invalid_capability_snapshot() {
+    let (svc, _, _, conv_repo, conv_service) = setup_with_conv_runtime().await;
+    conv_repo.set_raw_conversation_extra(
+        "conv_1",
+        serde_json::json!({
+            "capability_snapshot": {
+                "skill_ids": [],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": []
+            }
+        }),
+    );
+    let _claim = conv_service
+        .runtime_state()
+        .try_claim_turn("conv_1", "turn_helper_invalid_snapshot")
+        .expect("claim conversation");
+
+    let app = cron_routes(CronRouterState {
+        cron_service: Arc::new(svc),
+        conversation_service: (*conv_service).clone(),
+    })
+    .layer(Extension(current_user("u1")));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/internal/conversation-cron/create")
+                .header("content-type", "application/json")
+                .header("x-aionui-user-id", "u1")
+                .header("x-aionui-conversation-id", "conv_1")
+                .body(Body::from(
+                    serde_json::to_vec(&conversation_cron_request("create with invalid snapshot")).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(
+        body["error"],
+        "conversation capability snapshot is invalid: missing field `exclude_auto_inject_skills`"
+    );
 }
 
 #[tokio::test]

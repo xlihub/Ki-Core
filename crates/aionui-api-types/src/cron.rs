@@ -36,7 +36,7 @@ pub enum CronScheduleDto {
 // B. Agent configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CronAgentConfigReadDto {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,9 +57,13 @@ pub struct CronAgentConfigReadDto {
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    pub skill_ids: Vec<String>,
+    pub disabled_builtin_skill_ids: Vec<String>,
+    pub mcp_ids: Vec<String>,
+    pub exclude_auto_inject_skills: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CronAgentConfigWriteDto {
     pub name: String,
@@ -77,6 +81,10 @@ pub struct CronAgentConfigWriteDto {
     pub config_options: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    pub skill_ids: Vec<String>,
+    pub disabled_builtin_skill_ids: Vec<String>,
+    pub mcp_ids: Vec<String>,
+    pub exclude_auto_inject_skills: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,14 +320,17 @@ mod write_tests {
     }
 
     #[test]
-    fn cron_agent_config_write_allows_assistant_only_payload() {
-        let parsed = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
+    fn cron_agent_config_write_rejects_incomplete_capability_snapshot() {
+        let err = serde_json::from_value::<CronAgentConfigWriteDto>(serde_json::json!({
             "name": "Helper",
             "assistant_id": "assistant-1",
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
         }))
-        .expect("assistant-backed writes should not require backend");
+        .expect_err("all capability snapshot fields are required");
 
-        assert_eq!(parsed.assistant_id.as_deref(), Some("assistant-1"));
+        assert!(err.to_string().contains("exclude_auto_inject_skills"));
     }
 }
 
@@ -498,7 +509,11 @@ mod tests {
             "model_id": "claude-sonnet-4-6",
             "model": {"provider_id": "provider-1", "model": "claude-sonnet-4-6"},
             "config_options": {"key": "value"},
-            "workspace": "/tmp/ws"
+            "workspace": "/tmp/ws",
+            "skill_ids": ["report-skill"],
+            "disabled_builtin_skill_ids": ["legacy-builtin"],
+            "mcp_ids": ["builtin-adapter"],
+            "exclude_auto_inject_skills": ["legacy-auto-skill"]
         });
         let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.name, "Claude Agent");
@@ -512,11 +527,41 @@ mod tests {
             Some("provider-1")
         );
         assert_eq!(c.config_options.as_ref().unwrap()["key"], "value");
+        assert_eq!(serde_json::to_value(&c).unwrap()["skill_ids"], json!(["report-skill"]));
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["disabled_builtin_skill_ids"],
+            json!(["legacy-builtin"])
+        );
+        assert_eq!(serde_json::to_value(&c).unwrap()["mcp_ids"], json!(["builtin-adapter"]));
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["exclude_auto_inject_skills"],
+            json!(["legacy-auto-skill"])
+        );
+    }
+
+    #[test]
+    fn agent_config_write_accepts_capability_snapshot() {
+        let raw = json!({
+            "name": "Agents Execution Assistant",
+            "assistant_id": "agents-executor",
+            "skill_ids": ["report-skill"],
+            "disabled_builtin_skill_ids": ["legacy-builtin"],
+            "mcp_ids": ["builtin-adapter"],
+            "exclude_auto_inject_skills": ["legacy-auto-skill"]
+        });
+
+        assert!(serde_json::from_value::<CronAgentConfigWriteDto>(raw).is_ok());
     }
 
     #[test]
     fn agent_config_minimal() {
-        let raw = json!({"name": "GPT"});
+        let raw = json!({
+            "name": "GPT",
+            "skill_ids": [],
+            "disabled_builtin_skill_ids": [],
+            "mcp_ids": [],
+            "exclude_auto_inject_skills": []
+        });
         let c: CronAgentConfigReadDto = serde_json::from_value(raw).unwrap();
         assert_eq!(c.name, "GPT");
         assert!(c.cli_path.is_none());
@@ -537,6 +582,10 @@ mod tests {
             model: None,
             config_options: None,
             workspace: None,
+            skill_ids: Vec::new(),
+            disabled_builtin_skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            exclude_auto_inject_skills: Vec::new(),
         };
         let json = serde_json::to_value(&c).unwrap();
         assert!(json.get("cli_path").is_none());
@@ -561,6 +610,10 @@ mod tests {
             }),
             config_options: Some(HashMap::from([("a".into(), "b".into())])),
             workspace: Some("/ws".into()),
+            skill_ids: Vec::new(),
+            disabled_builtin_skill_ids: Vec::new(),
+            mcp_ids: Vec::new(),
+            exclude_auto_inject_skills: Vec::new(),
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronAgentConfigReadDto = serde_json::from_str(&json).unwrap();
@@ -604,6 +657,10 @@ mod tests {
                     model: None,
                     config_options: None,
                     workspace: None,
+                    skill_ids: Vec::new(),
+                    disabled_builtin_skill_ids: Vec::new(),
+                    mcp_ids: Vec::new(),
+                    exclude_auto_inject_skills: Vec::new(),
                 }),
             },
             state: CronJobStateDto {
@@ -706,7 +763,14 @@ mod tests {
             "conversation_title": "Tasks",
             "created_by": "user",
             "execution_mode": "new_conversation",
-            "agent_config": {"name": "Claude", "assistant_id": "assistant-1"}
+            "agent_config": {
+                "name": "Claude",
+                "assistant_id": "assistant-1",
+                "skill_ids": [],
+                "disabled_builtin_skill_ids": [],
+                "mcp_ids": [],
+                "exclude_auto_inject_skills": []
+            }
         });
         let req: CreateCronJobRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name, "Daily task");

@@ -4,6 +4,14 @@ This changelog records Ki-Core product releases. Runtime changes inherited from
 AionCore remain in [CHANGELOG.md](CHANGELOG.md) and are linked through the
 version mapping in [ki-core-versions.json](ki-core-versions.json).
 
+## [0.1.4](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.3...ki-core-v0.1.4) (2026-08-27)
+
+
+### Bug Fixes
+
+* **cron:** preserve scheduled task capabilities ([95699ff](https://github.com/xlihub/Ki-Core/commit/95699ff601e18bea22d77b13c9b5cddd5742527e))
+* **cron:** preserve scheduled task capabilities ([852782d](https://github.com/xlihub/Ki-Core/commit/852782d96407efd2c57461ad9b13ff4e785f96c2))
+
 ## [0.1.3](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.2...ki-core-v0.1.3) (2026-08-25)
 
 

@@ -12,6 +12,9 @@ aioncore_slug="iOfficeAI/AionCore"
 fail() { echo "error: $*" >&2; exit 1; }
 
 # --- preflight ---
+if [[ -f "$repo_root/ki-core-model.json" ]]; then
+    fail "Ki-Core pins Ki-Model independently; adopt a verified SDK release through a product/main PR"
+fi
 command -v gh >/dev/null 2>&1 || fail "gh CLI not found"
 gh auth status >/dev/null 2>&1 || fail "gh not authenticated; run 'gh auth login'"
 cd "$repo_root"

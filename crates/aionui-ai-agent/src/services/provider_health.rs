@@ -64,7 +64,7 @@ impl ProviderHealthCheckService {
             .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
         let config = self.resolve_probe_config(&row, model)?;
-        run_probe(row.id, row.platform, config).await
+        probe_resolved_provider(row.id, row.platform, config).await
     }
 
     fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AgentError> {
@@ -109,11 +109,19 @@ impl ProviderHealthCheckService {
     }
 }
 
-async fn run_probe(
+/// Run the existing bounded health probe with a programmatically resolved provider.
+/// This does not persist configuration or credentials.
+pub async fn probe_resolved_provider(
     provider_id: String,
     platform: String,
-    config_extra: AionrsResolvedConfig,
+    mut config_extra: AionrsResolvedConfig,
 ) -> Result<ProviderHealthCheckResponse, AgentError> {
+    config_extra.max_tokens = Some(HEALTH_CHECK_MAX_TOKENS);
+    config_extra.max_turns = Some(1);
+    config_extra.max_tool_call_malformed_turns = Some(1);
+    config_extra.max_tool_call_failure_turns = Some(1);
+    config_extra.system_prompt =
+        Some("You are a provider health probe. Reply with exactly OK and do not use tools.".into());
     let started = Instant::now();
     let model = config_extra.model.clone();
 
@@ -140,6 +148,17 @@ async fn run_probe(
     )
     .await
     {
+        Ok(Ok(result))
+            if result.text.trim().is_empty() || result.stop_reason != aion_types::message::StopReason::EndTurn =>
+        {
+            let message = format!(
+                "Provider returned no complete answer (stop_reason={:?})",
+                result.stop_reason
+            );
+            let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, None);
+            log_health_check_result(&response);
+            Ok(response)
+        }
         Ok(Ok(_)) => {
             let response = ProviderHealthCheckResponse {
                 provider_id,
@@ -241,7 +260,11 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
         config.compat.transport.api_path = Some(path);
     }
 
+    let provider =
+        crate::manager::aionrs::providers::create_provider(&config, config_extra.compat_overrides.gateway.as_ref())
+            .map_err(|error| AgentError::internal(format!("Provider creation failed: {error}")))?;
     AgentBootstrap::new(config, workspace, sink)
+        .provider(provider)
         .runtime_env(config_extra.runtime_env)
         .build()
         .await

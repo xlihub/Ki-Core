@@ -113,15 +113,19 @@ impl IProviderRepository for SqliteProviderRepository {
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
 
+        let revision = existing.updated_at;
+        if params.expected_updated_at.is_some_and(|expected| expected != revision) {
+            return Err(DbError::Conflict("Provider changed; reload and retry".into()));
+        }
         let merged = merge_update(existing, params);
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE providers SET \
                 platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_protocols = ?, model_enabled = ?, model_health = ?, \
                 model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ?, model_mode = ?, gateway = ?, header_credentials_encrypted = ? \
-             WHERE user_id = ? AND id = ?",
+             WHERE user_id = ? AND id = ? AND updated_at = ?",
         )
         .bind(&merged.platform)
         .bind(&merged.name)
@@ -143,8 +147,12 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.header_credentials_encrypted)
         .bind(user_id)
         .bind(id)
+        .bind(revision)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::Conflict("Provider changed; reload and retry".into()));
+        }
 
         Ok(merged)
     }
@@ -171,7 +179,7 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 
 /// Merge partial update params into an existing provider, returning a new instance.
 fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provider {
-    let now = aionui_common::now_ms();
+    let now = aionui_common::now_ms().max(existing.updated_at.saturating_add(1));
     Provider {
         gateway: params.gateway.map_or(existing.gateway, |v| v.map(String::from)),
         header_credentials_encrypted: params
@@ -255,6 +263,43 @@ mod tests {
             bedrock_config: None,
             is_full_url: false,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_provider_update_is_rejected_without_overwriting_credentials() {
+        let (repo, _db) = setup().await;
+        let original = repo.create(sample_params()).await.unwrap();
+        let saved = repo
+            .update(
+                USER_A,
+                &original.id,
+                UpdateProviderParams {
+                    expected_updated_at: Some(original.updated_at),
+                    header_credentials_encrypted: Some(Some("new-ciphertext")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(saved.updated_at > original.updated_at);
+        let error = repo
+            .update(
+                USER_A,
+                &original.id,
+                UpdateProviderParams {
+                    expected_updated_at: Some(original.updated_at),
+                    name: Some("stale name"),
+                    header_credentials_encrypted: Some(Some("stale-ciphertext")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::Conflict(_)));
+        let actual = repo.find_by_id(USER_A, &original.id).await.unwrap().unwrap();
+        assert_eq!(actual.name, original.name);
+        assert_eq!(actual.header_credentials_encrypted.as_deref(), Some("new-ciphertext"));
+        assert_eq!(actual.updated_at, saved.updated_at);
     }
 
     #[tokio::test]

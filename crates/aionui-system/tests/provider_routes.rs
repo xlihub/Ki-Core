@@ -937,3 +937,49 @@ async fn credential_failures_and_conflicting_updates_leave_saved_connection_unch
     assert_eq!(response.status(), StatusCode::OK);
     assert!(body_json(response).await["data"].get("gateway").is_none());
 }
+
+#[tokio::test]
+async fn concurrent_credential_updates_preserve_both_values_or_report_conflict() {
+    let (app, db) = setup().await;
+    let response = app.clone().oneshot(json_request("POST", "/api/providers", json!({
+        "id":"concurrent-gateway", "platform":"custom", "name":"Concurrent", "base_url":"http://localhost:1/invoke",
+        "gateway":{"auth":"none", "headers":[{"name":"X-One","sensitive":true},{"name":"X-Two","sensitive":true}]},
+        "header_credentials":{"x-one":{"action":"replace","value":"old-one"},"x-two":{"action":"replace","value":"old-two"}}
+    }))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for revision in 0..8 {
+        let one = format!("new-one-{revision}");
+        let two = format!("new-two-{revision}");
+        let first = json!({"header_credentials":{"x-one":{"action":"replace","value":one}}});
+        let second = json!({"header_credentials":{"x-two":{"action":"replace","value":two}}});
+        let (a, b) = tokio::join!(
+            app.clone()
+                .oneshot(json_request("PUT", "/api/providers/concurrent-gateway", first.clone())),
+            app.clone()
+                .oneshot(json_request("PUT", "/api/providers/concurrent-gateway", second.clone()))
+        );
+        for (response, body) in [(a.unwrap(), first), (b.unwrap(), second)] {
+            match response.status() {
+                StatusCode::OK => {}
+                StatusCode::CONFLICT => {
+                    let retry = app
+                        .clone()
+                        .oneshot(json_request("PUT", "/api/providers/concurrent-gateway", body))
+                        .await
+                        .unwrap();
+                    assert_eq!(retry.status(), StatusCode::OK);
+                }
+                status => panic!("unexpected update status: {status}"),
+            }
+        }
+        let encrypted: String =
+            sqlx::query_scalar("SELECT header_credentials_encrypted FROM providers WHERE id = 'concurrent-gateway'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let plaintext = aionui_common::decrypt_string(&encrypted, &TEST_ENCRYPTION_KEY).unwrap();
+        let credentials: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+        assert_eq!(credentials["x-one"], one);
+        assert_eq!(credentials["x-two"], two);
+    }
+}

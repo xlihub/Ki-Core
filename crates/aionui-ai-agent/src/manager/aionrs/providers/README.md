@@ -98,7 +98,7 @@ python3 scripts/ki-core-release/validate-model-pin.py
 }
 ```
 
-新增敏感头声明时必须同时写入凭据，或显式 clear 保存为未配置状态。clear 后该头的 configured=false，聊天/恢复/健康检查在联网前报缺失凭据；名称等普通保存不误删凭据。替换验证和加密在数据库写入前完成；失败不更新记录。凭据按 AES-256-GCM 加密为独立列，公开 gateway JSON 只存元数据与普通值。解密失败明确报错、不回显密文；可用 clear_gateway 恢复。现有 API Key 继续采用原有加密及读写兼容语义（旧 API 明文返回约定未改变）。
+新增敏感头声明时必须同时写入凭据，或显式 clear 保存为未配置状态。clear 后该头的 configured=false，聊天/恢复/健康检查在联网前报缺失凭据；名称等普通保存不误删凭据。替换验证和加密在数据库写入前完成；失败不更新记录。通过 service 加密边界注入 RNG/AES 故障，已验证创建不产生记录、更新不改写原值，错误响应不含加密内部详情。并发更新使用已验证记录的 updated_at 检查并执行条件写入；过期请求返回 409，重新读取后可重试，避免覆盖其他请求刚保存的凭据。凭据按 AES-256-GCM 加密为独立列，公开 gateway JSON 只存元数据与普通值。解密失败明确报错、不回显密文；可用 clear_gateway 恢复。现有 API Key 继续采用原有加密及读写兼容语义（旧 API 明文返回约定未改变）。
 
 migration 043 为已有连接设置 automatic、gateway/凭据为空，不重写历史 migration。其他基础 DTO/row 初始化位置只添加默认值。
 
@@ -112,11 +112,12 @@ migration 043 为已有连接设置 automatic、gateway/凭据为空，不重写
 
 Core INFO 日志记录 provider/model、只含 origin 的 endpoint（不含路径/查询参数）、代理/超时策略、首输出耗时、结束状态与 usage。HTTP 错误状态通过健康结果和现有 SDK 日志提供；SDK 正常流 HTTP 状态摘要在 DEBUG、异常摘要在 WARN。所有新增日志不输出提示词、工具内容、API Key 或新增凭据。SDK 负责已配置鉴权值的错误脱敏。
 
-### 未完成的验收项
+### SDK 后续工作与目标环境验证
+
+- 现场响应离线回放发现 SDK 错误契约仍不足：HTTP 202 携带 `errcode/errmsg` 的业务拒绝，在当前 Core 健康检查中被报告为 interrupted，且 SDK 发送 3 次请求；HTTP 200 的非 JSON 文本 SSE 错误统一为 api_error / Invalid JSON，鉴权、模型及参数拒绝原因丢失。均未误报成功，但不能据此将 #23/#25 的错误可辨识验收标为通过。维护者已将这类错误识别、重试及下述流超时类型问题统一转交 [Ki-Model #11](https://github.com/xlihub/Ki-Model/issues/11#issuecomment-5659161383)，不阻塞本次 Core 成功调用链路开发。后续通过正式 SDK 修复版本提供业务错误、真实 HTTP 状态及正确重试属性，再更新 Core 固定 pin；Core 不写死客户错误码或文本。
 
 - Windows 目标环境未验证。macOS 的受控代理测试和跨平台可编译源码不能替代此项。
 - Ki-Model 0.1.1 `crates/aion-providers/src/stream_process.rs` 在 body read 失败时调用 `e.without_url().to_string()`，丢失 reqwest `is_timeout()`。因此已开始的流读取超时目前会停止请求并报告 interrupted，不能可靠地细分为 timeout；不能根据耗时猜测错误类型。握手/首响应等待阶段保留 typed error，能够报告 timeout，并给出 connect 或 request_or_read。精确区分 body read 超时需要正式 SDK 扩展后再升级固定 pin。现有测试明确记录这一限制。
-- 加密函数失败已采用写入前返回路径；生产构造器固定接受 32-byte key，尚未通过 API 注入 OS RNG/AES 加密故障。已验证密文不含明文、重开数据库复用、损坏密文报错以及失败更新不改写记录。
 
 ## 本次验证入口
 
@@ -132,3 +133,11 @@ cargo test --workspace --locked
 ```
 
 新测试覆盖 API 到已保存配置再到真实 HTTP 请求、真实 factory 新建/恢复、Bearer 与多个头并存及切换、stream_options 更新、31 秒首事件、握手/请求/流空闲策略、取消、截断、鉴权失败与脱敏、用户隔离、磁盘数据库重开及旧迁移兼容。健康检查完整 HTTP 路由测试复用现有认证/CSRF 测试组。
+
+## 现场交叉核对（2026-09-14）
+
+已核对现场 ZIP 的 SHA-256（`0c6af895c89e2d64f07b2ba19e667fa254d4259e761237d7c069b0cdc5a9fe7e`）、CRC，以及 21 组 result/summary 与原始 body 长度。现场完整 URL、请求模型与响应别名不同、仅请求头鉴权及附加 Bearer 的行为与通用配置设计一致；原始数据和凭据不加入仓库。
+
+当前 Core 经临时离线测试，把 7 组原始响应交给本机 HTTP mock，通过实际 ProviderService 持久化配置、ProviderHealthCheckService 和固定 SDK 执行：08 普通流、13 stream_options、14 健康检查均 healthy；03/04/17/20 的结果见上述未完成项。只回放响应，不联系客户地址，不复用客户凭据，不模拟原始网络时序；不能把这一结果称为真实 Core 客户端的现场验收。
+
+现场 `stream_options.include_usage=true` 已成功；未携带该字段时也返回 usage，不能将关闭选项描述为必需兼容措施。现场 SystemProxy 成功时目标实际绕过代理，不能替代本机受控代理测试或 Windows reqwest 验证。现场正常健康请求完成于 293ms，也不能覆盖生产慢响应、负载或长流策略。

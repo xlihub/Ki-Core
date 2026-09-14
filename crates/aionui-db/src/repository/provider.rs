@@ -54,6 +54,8 @@ pub struct CreateProviderParams<'a> {
 /// All fields are optional; `None` means "keep the current value".
 #[derive(Debug, Default)]
 pub struct UpdateProviderParams<'a> {
+    /// Reject updates whose validated snapshot has since changed.
+    pub expected_updated_at: Option<i64>,
     pub gateway: Option<Option<&'a str>>,
     pub header_credentials_encrypted: Option<Option<&'a str>>,
 

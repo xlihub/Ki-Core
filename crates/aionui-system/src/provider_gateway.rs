@@ -1,10 +1,11 @@
 //! Persistence and validation of optional OpenAI connection settings.
 use crate::error::SystemError;
 use aionui_api_types::{GatewayAuth, HeaderCredentialUpdate, HeaderCredentialUpdates, ProviderGateway};
-use aionui_common::{decrypt_string, encrypt_string};
+use aionui_common::{CryptoError, decrypt_string};
 use std::collections::{HashMap, HashSet};
 
 type Credentials = HashMap<String, String>;
+pub(crate) type EncryptCredentials = fn(&str, &[u8]) -> Result<String, CryptoError>;
 
 pub(crate) fn read_gateway(raw: Option<&str>) -> Result<Option<ProviderGateway>, SystemError> {
     raw.map(serde_json::from_str)
@@ -29,6 +30,7 @@ pub(crate) fn prepare(
     previous_gateway: Option<&ProviderGateway>,
     updates: &HeaderCredentialUpdates,
     key: &[u8],
+    encrypt: EncryptCredentials,
 ) -> Result<Option<String>, SystemError> {
     let mut credentials = read_credentials(previous, key)?;
     let Some(gateway) = gateway else {
@@ -128,7 +130,7 @@ pub(crate) fn prepare(
     }
     let plaintext = serde_json::to_string(&credentials)
         .map_err(|_| SystemError::Internal("Could not encode gateway credentials".into()))?;
-    encrypt_string(&plaintext, key)
+    encrypt(&plaintext, key)
         .map(Some)
         .map_err(|_| SystemError::Internal("Gateway credential encryption failed".into()))
 }

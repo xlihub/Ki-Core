@@ -15,11 +15,16 @@ mod gateway;
 pub struct ProviderService {
     repo: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
+    encrypt_credentials: gateway::EncryptCredentials,
 }
 
 impl ProviderService {
     pub fn new(repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32]) -> Self {
-        Self { repo, encryption_key }
+        Self {
+            repo,
+            encryption_key,
+            encrypt_credentials: encrypt_string,
+        }
     }
 
     /// List all providers with masked API keys.
@@ -47,6 +52,7 @@ impl ProviderService {
             None,
             &req.header_credentials,
             &self.encryption_key,
+            self.encrypt_credentials,
         )?;
         let gateway_json = serialize_opt(&req.gateway, "gateway")?;
         let encrypted_key = encrypt_string(&req.api_key, &self.encryption_key)?;
@@ -108,15 +114,6 @@ impl ProviderService {
                 req.models.as_deref().unwrap_or(&models),
                 req.is_full_url.unwrap_or(existing.is_full_url),
             )?;
-            let protocols = req
-                .model_protocols
-                .clone()
-                .or(deserialize_opt(&existing.model_protocols, "model_protocols")?);
-            let settings = req.model_settings.clone().unwrap_or(
-                serde_json::from_str(&existing.model_settings)
-                    .map_err(|_| SystemError::Internal("Invalid model settings".into()))?,
-            );
-            validate_gateway_protocols(protocols.as_ref(), &settings)?;
         }
 
         if req.clear_gateway && (req.gateway.is_some() || !req.header_credentials.is_empty()) {
@@ -130,12 +127,7 @@ impl ProviderService {
         } else {
             req.gateway.clone().or(previous_gateway.clone())
         };
-        if let Some(gateway) = &gateway {
-            let api_key = match &req.api_key {
-                Some(key) => key.clone(),
-                None => decrypt_string(&existing.api_key_encrypted, &self.encryption_key)?,
-            };
-            gateway::validate_policy(gateway, req.platform.as_deref().unwrap_or(&existing.platform), &api_key)?;
+        if manual || gateway.is_some() {
             let protocols = req
                 .model_protocols
                 .clone()
@@ -146,12 +138,15 @@ impl ProviderService {
             );
             validate_gateway_protocols(protocols.as_ref(), &settings)?;
         }
-        if req.clear_gateway {
+        if gateway.is_some() || req.clear_gateway {
             let api_key = match &req.api_key {
                 Some(key) => key.clone(),
                 None => decrypt_string(&existing.api_key_encrypted, &self.encryption_key)?,
             };
-            if api_key.trim().is_empty() {
+            if let Some(gateway) = &gateway {
+                gateway::validate_policy(gateway, req.platform.as_deref().unwrap_or(&existing.platform), &api_key)?;
+            }
+            if req.clear_gateway && api_key.trim().is_empty() {
                 return Err(SystemError::BadRequest(
                     "Restoring default Bearer authentication requires apiKey".into(),
                 ));
@@ -167,6 +162,7 @@ impl ProviderService {
                 previous_gateway.as_ref(),
                 &req.header_credentials,
                 &self.encryption_key,
+                self.encrypt_credentials,
             )?
         };
         let gateway_json = serialize_opt(&gateway, "gateway")?;
@@ -184,6 +180,7 @@ impl ProviderService {
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
 
         let params = UpdateProviderParams {
+            expected_updated_at: Some(existing.updated_at),
             gateway: gateway_changed.then_some(gateway_json.as_deref()),
             header_credentials_encrypted: gateway_changed.then_some(credentials.as_deref()),
             model_mode: req.model_mode.map(mode_name),
@@ -437,6 +434,54 @@ mod tests {
         let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         std::mem::forget(db);
         ProviderService::new(repo, TEST_KEY)
+    }
+
+    #[tokio::test]
+    async fn credential_encryption_failure_does_not_create_or_modify_provider() {
+        use aionui_common::CryptoError;
+        fn random_failure(_: &str, _: &[u8]) -> Result<String, CryptoError> {
+            Err(CryptoError::Random("synthetic-private-RNG-detail".into()))
+        }
+        fn cipher_failure(_: &str, _: &[u8]) -> Result<String, CryptoError> {
+            Err(CryptoError::Encryption("synthetic-private-AES-detail".into()))
+        }
+        for encrypt in [random_failure as gateway::EncryptCredentials, cipher_failure] {
+            let mut svc = setup().await;
+            let request = serde_json::json!({
+                "platform":"custom", "name":"Encrypted", "base_url":"http://localhost:1/invoke",
+                "models":["synthetic-model"], "gateway":{"auth":"none", "headers":[{"name":"X-Secret", "sensitive":true}]},
+                "header_credentials":{"x-secret":{"action":"replace", "value":"synthetic-secret"}}
+            });
+            svc.encrypt_credentials = encrypt;
+            let error = svc
+                .create(TEST_USER_ID, serde_json::from_value(request.clone()).unwrap())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Internal error: Gateway credential encryption failed"
+            );
+            assert!(svc.list(TEST_USER_ID).await.unwrap().is_empty());
+            svc.encrypt_credentials = encrypt_string;
+            let created = svc
+                .create(TEST_USER_ID, serde_json::from_value(request).unwrap())
+                .await
+                .unwrap();
+            let before = svc.repo.find_by_id(TEST_USER_ID, &created.id).await.unwrap().unwrap();
+            svc.encrypt_credentials = encrypt;
+            let error = svc.update(TEST_USER_ID, &created.id, serde_json::from_value(serde_json::json!({
+                "name":"Must not change", "header_credentials":{"x-secret":{"action":"replace", "value":"new-secret"}}
+            })).unwrap()).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Internal error: Gateway credential encryption failed"
+            );
+            let after = svc.repo.find_by_id(TEST_USER_ID, &created.id).await.unwrap().unwrap();
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.updated_at, before.updated_at);
+            assert_eq!(after.gateway, before.gateway);
+            assert_eq!(after.header_credentials_encrypted, before.header_credentials_encrypted);
+        }
     }
 
     fn sample_create_request() -> CreateProviderRequest {

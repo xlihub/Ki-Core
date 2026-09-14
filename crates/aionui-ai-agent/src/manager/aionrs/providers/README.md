@@ -141,3 +141,9 @@ cargo test --workspace --locked
 当前 Core 经临时离线测试，把 7 组原始响应交给本机 HTTP mock，通过实际 ProviderService 持久化配置、ProviderHealthCheckService 和固定 SDK 执行：08 普通流、13 stream_options、14 健康检查均 healthy；03/04/17/20 的结果见上述未完成项。只回放响应，不联系客户地址，不复用客户凭据，不模拟原始网络时序；不能把这一结果称为真实 Core 客户端的现场验收。
 
 现场 `stream_options.include_usage=true` 已成功；未携带该字段时也返回 usage，不能将关闭选项描述为必需兼容措施。现场 SystemProxy 成功时目标实际绕过代理，不能替代本机受控代理测试或 Windows reqwest 验证。现场正常健康请求完成于 293ms，也不能覆盖生产慢响应、负载或长流策略。
+
+### 真实 Core 进程连接现场协议 mock
+
+2026-09-14 已从功能分支构建真实 aioncore 二进制，启动独立数据目录的本机 HTTP 服务，连接 KiBuddy 现场协议 mock 的 field 模式。通过公开 Core API 创建 manual 连接并保存三项敏感头，验证模型读取不发现、健康检查、普通聊天、真实 Read 工具及结果回传；随后完全停止并重启 Core，用同一数据目录恢复同一会话继续聊天，再分别打开/关闭 Bearer 与 stream_options。
+
+mock 共记录 8 次完整的 HTTP 200 请求，完整路径、请求模型和三项鉴权全部匹配。真实 Read 工具读取了本次随机生成的文件内容；持久化的最终 assistant text 为 finish 且包含该内容。磁盘 gateway 元数据与凭据密文中不含三项明文。全部使用公开 mock 凭据、本机随机端口和独立测试数据；服务验证后正常停止。本机真实进程验证仍不替代 Windows 和客户正式包验收。

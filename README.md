@@ -56,6 +56,6 @@ Release-As: X.Y.Z
 `ki-core-version.txt`、manifest、changelog 和版本映射均使用目标版本。
 这个 footer 只指定本次发布，不在配置中保存 `release-as`，也不改变后续 SemVer 规则。
 
-普通版本选择提交的标题不要使用 `chore: release` 或 `chore(product/main): release`；
+普通版本选择提交的消息（含正文）不要包含 `chore: release` 或 `chore(product/main): release`；
 这两种标题会让仓库 workflow 进入创建 tag 的路径。正式 Release PR 合并后，
 仍由维护者批准 `ki-core-stable` Environment，再构建六个平台产物与 checksums。

@@ -73,3 +73,45 @@ async fn provider_health_check_validates_required_fields() {
         "expected provider_id validation error, got {json}"
     );
 }
+
+#[tokio::test]
+async fn health_route_uses_gateway_saved_through_provider_api() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/gateway/invoke/"))
+        .and(header("x-synthetic-key","synthetic-secret"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(
+            "data:{\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata:{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata:[DONE]\n\n"))
+        .expect(1).mount(&server).await;
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let response=app.clone().oneshot(json_with_token("POST","/api/providers",json!({
+        "id":"api-gateway","platform":"custom","name":"Gateway","base_url":format!("{}/gateway/invoke/",server.uri()),"is_full_url":true,"model_mode":"manual","models":["synthetic-model"],
+        "gateway":{"auth":"none","proxy":"direct","include_stream_options":false,"headers":[{"name":"X-Synthetic-Key","sensitive":true}]},
+        "header_credentials":{"X-Synthetic-Key":{"action":"replace","value":"synthetic-secret"}}
+    }),&token,&csrf)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(!body_json(response).await.to_string().contains("synthetic-secret"));
+    let response = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/agents/provider-health-check",
+            json!({"provider_id":"api-gateway","model":"synthetic-model"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    assert_eq!(response["data"]["status"], "healthy", "{response}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].headers.contains_key("authorization"));
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "synthetic-model");
+    assert!(body.get("stream_options").is_none());
+}

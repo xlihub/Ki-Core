@@ -650,3 +650,290 @@ async fn full_crud_flow() {
     let list_json = body_json(resp).await;
     assert_eq!(list_json["data"], json!([]));
 }
+
+#[tokio::test]
+async fn manual_connection_survives_router_restart_without_discovery() {
+    let (app, db) = setup().await;
+    let server = wiremock::MockServer::start().await;
+    let url = format!("{}/gateway/invoke?tenant=synthetic", server.uri());
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/providers",
+            json!({
+                "id": "manual-connection", "platform": "custom", "name": "Manual",
+                "base_url": url, "api_key": "synthetic-key", "models": ["request-model"],
+                "is_full_url": true, "model_mode": "manual"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(body_json(response).await["data"]["model_mode"], "manual");
+    let restarted = system_routes(build_state(&db));
+    let response = restarted.clone().oneshot(get_request("/api/providers")).await.unwrap();
+    let listed = body_json(response).await;
+    assert_eq!(listed["data"][0]["base_url"], url);
+    assert_eq!(listed["data"][0]["model_mode"], "manual");
+    let response = restarted
+        .oneshot(json_request(
+            "POST",
+            "/api/providers/manual-connection/models",
+            json!({"try_fix": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"]["models"], json!(["request-model"]));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_credentials_are_encrypted_retained_replaced_and_cleared() {
+    let (app, db) = setup().await;
+    let body = json!({"id":"header-connection", "platform":"custom", "name":"Gateway", "base_url":"http://localhost:1/invoke",
+        "models":["synthetic-model"], "is_full_url":true, "model_mode":"manual",
+        "gateway": {"auth":"none", "headers":[{"name":"X-Tenant", "value":"synthetic-tenant"}, {"name":"X-Secret", "sensitive":true}]},
+        "header_credentials": {"X-Secret":{"action":"replace", "value":"synthetic-secret-one"}}
+    });
+    let response = app
+        .clone()
+        .oneshot(json_request("POST", "/api/providers", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    assert!(!created.to_string().contains("synthetic-secret-one"));
+    assert_eq!(created["data"]["gateway"]["headers"][1]["configured"], true);
+    let ciphertext: String =
+        sqlx::query_scalar("SELECT header_credentials_encrypted FROM providers WHERE id = 'header-connection'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(!ciphertext.contains("synthetic-secret-one"));
+    let plaintext = aionui_common::decrypt_string(&ciphertext, &TEST_ENCRYPTION_KEY).unwrap();
+    assert!(plaintext.contains("synthetic-secret-one"));
+    for update in [
+        json!({"name":"Renamed"}),
+        json!({"header_credentials":{"x-secret":{"action":"keep"}}}),
+    ] {
+        let response = system_routes(build_state(&db))
+            .oneshot(json_request("PUT", "/api/providers/header-connection", update))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["data"]["gateway"]["headers"][1]["configured"],
+            true
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/api/providers/header-connection",
+            json!({"header_credentials":{"x-secret":{"action":"replace", "value":"synthetic-secret-two"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/api/providers/header-connection",
+            json!({"header_credentials":{"x-secret":{"action":"clear"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await["data"]["gateway"]["headers"][1]["configured"],
+        false
+    );
+    let response = app
+        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/providers"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(response).await["data"], json!([]));
+}
+
+#[tokio::test]
+async fn invalid_gateway_configuration_is_rejected_without_disclosing_values() {
+    let (app, _db) = setup().await;
+    for (gateway, credentials, expected) in [
+        (
+            json!({"auth":"none","headers":[{"name":"X-Key","sensitive":true}]}),
+            json!({}),
+            "Missing gateway credential",
+        ),
+        (
+            json!({"auth":"none","headers":[{"name":"X-Key","value":"one"},{"name":"x-KEY","value":"two"}]}),
+            json!({}),
+            "Duplicate gateway header",
+        ),
+        (
+            json!({"auth":"bearer","headers":[{"name":"AUTHORIZATION","value":"secret-echo-marker"}]}),
+            json!({}),
+            "Authorization header conflicts",
+        ),
+        (
+            json!({"auth":"none","headers":[{"name":"bad name","value":"secret-echo-marker"}]}),
+            json!({}),
+            "Invalid gateway header name",
+        ),
+        (
+            json!({"auth":"none","headers":[{"name":"X-Key","value":"secret-echo-marker\r\nBad: true"}]}),
+            json!({}),
+            "Invalid gateway header value",
+        ),
+        (
+            json!({"auth":"none","headers":[{"name":"X-Key","sensitive":true}]}),
+            json!({"x-key":{"action":"replace","value":"***"}}),
+            "cannot be a mask",
+        ),
+        (
+            json!({"auth":"none","read_timeout_ms":0}),
+            json!({}),
+            "millisecond range",
+        ),
+        (
+            json!({"auth":"none","connect_timeout_ms":300001}),
+            json!({}),
+            "millisecond range",
+        ),
+    ] {
+        let response = app.clone().oneshot(json_request("POST","/api/providers",json!({"platform":"custom","name":"Invalid","base_url":"http://localhost:1/invoke","api_key":"synthetic-bearer","gateway":gateway,"header_credentials":credentials}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = body_json(response).await.to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("secret-echo-marker"));
+    }
+}
+
+#[tokio::test]
+async fn manual_mode_validates_models_and_prevents_anonymous_probes() {
+    let (app, _db) = setup().await;
+    let server = wiremock::MockServer::start().await;
+    for models in [json!([]), json!([""]), json!([" spaced "])] {
+        let response= app.clone().oneshot(json_request("POST","/api/providers",json!({"platform":"custom","name":"Manual","base_url":server.uri(),"api_key":"synthetic","is_full_url":true,"model_mode":"manual","models":models}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .contains("model IDs")
+        );
+    }
+    let response=app.clone().oneshot(json_request("POST","/api/providers/fetch-models",json!({"platform":"custom","base_url":server.uri(),"api_key":"","model_mode":"manual","models":["synthetic"],"try_fix":true}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/providers/detect-protocol",
+            json!({"base_url":server.uri(),"api_key":"","model_mode":"manual"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("disabled in manual mode")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_survives_database_close_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.db");
+    let db = aionui_db::init_database(&path).await.unwrap();
+    let user = "system_default_user";
+    let app = system_routes(build_state(&db));
+    let response=app.oneshot(json_request_for_user(user,"POST","/api/providers",json!({"id":"durable-gateway","platform":"custom","name":"Durable","base_url":"http://localhost:1/invoke","model_mode":"manual","is_full_url":true,"models":["saved-model"],"gateway":{"auth":"none","proxy":"direct","include_stream_options":false,"read_timeout_ms":45000,"headers":[{"name":"X-Secret","sensitive":true}]},"header_credentials":{"x-secret":{"action":"replace","value":"durable-synthetic-secret"}}}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    db.pool().close().await;
+    drop(db);
+    let db = aionui_db::init_database(&path).await.unwrap();
+    let app = system_routes(build_state(&db));
+    let response = app.oneshot(get_request_for_user(user, "/api/providers")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let row = &body["data"][0];
+    assert_eq!(row["model_mode"], "manual");
+    assert_eq!(row["models"], json!(["saved-model"]));
+    assert_eq!(row["gateway"]["read_timeout_ms"], 45000);
+    assert_eq!(row["gateway"]["headers"][0]["configured"], true);
+    assert!(!body.to_string().contains("durable-synthetic-secret"));
+}
+
+#[tokio::test]
+async fn credential_failures_and_conflicting_updates_leave_saved_connection_unchanged() {
+    let (app, db) = setup().await;
+    let response=app.clone().oneshot(json_request("POST","/api/providers",json!({"id":"stable-gateway","platform":"custom","name":"Stable","base_url":"http://localhost:1/invoke","api_key":"synthetic-key","gateway":{"auth":"none","headers":[{"name":"X-Key","sensitive":true}]},"header_credentials":{"x-key":{"action":"replace","value":"synthetic-secret"}}}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let before: String =
+        sqlx::query_scalar("SELECT header_credentials_encrypted FROM providers WHERE id='stable-gateway'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    for update in [
+        json!({"gateway":{"auth":"none","headers":[{"name":"X-New","sensitive":true}]}}),
+        json!({"gateway":{"auth":"bearer"},"api_key":""}),
+        json!({"header_credentials":{"X-Key":{"action":"keep"},"x-key":{"action":"clear"}}}),
+        json!({"gateway":{"auth":"none","headers":[{"name":"X-Key","sensitive":true,"value":"***"}]}}),
+        json!({"clear_gateway":true,"gateway":{}}),
+        json!({"model_settings":{"synthetic":{"openai_api_mode":"responses"}}}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request("PUT", "/api/providers/stable-gateway", update))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "BAD_REQUEST");
+        let after: String =
+            sqlx::query_scalar("SELECT header_credentials_encrypted FROM providers WHERE id='stable-gateway'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(after, before);
+    }
+    let response = app
+        .clone()
+        .oneshot(json_request_for_user(
+            OTHER_USER_ID,
+            "PUT",
+            "/api/providers/stable-gateway",
+            json!({"header_credentials":{"x-key":{"action":"clear"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    sqlx::query(
+        "UPDATE providers SET header_credentials_encrypted='corrupt-synthetic-ciphertext' WHERE id='stable-gateway'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let response = app.clone().oneshot(get_request("/api/providers")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !body_json(response)
+            .await
+            .to_string()
+            .contains("corrupt-synthetic-ciphertext")
+    );
+    let response = app
+        .oneshot(json_request(
+            "PUT",
+            "/api/providers/stable-gateway",
+            json!({"clear_gateway":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_json(response).await["data"].get("gateway").is_none());
+}

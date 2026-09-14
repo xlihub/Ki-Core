@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 /// deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Provider {
+    pub gateway: Option<String>,
+    pub header_credentials_encrypted: Option<String>,
+
+    pub model_mode: String,
     pub id: String,
     pub user_id: String,
     pub platform: String,

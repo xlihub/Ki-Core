@@ -49,8 +49,8 @@ impl IProviderRepository for SqliteProviderRepository {
             "INSERT INTO providers \
                 (id, user_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                  capabilities, context_limit, model_protocols, model_enabled, \
-                 model_health, model_settings, bedrock_config, is_full_url, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 model_health, model_settings, bedrock_config, is_full_url, created_at, updated_at, model_mode, gateway, header_credentials_encrypted) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.user_id)
@@ -70,6 +70,9 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(params.is_full_url)
         .bind(now)
         .bind(now)
+        .bind(params.model_mode)
+        .bind(params.gateway)
+        .bind(params.header_credentials_encrypted)
         .execute(&self.pool)
         .await
         .map_err(|e| match &e {
@@ -80,6 +83,9 @@ impl IProviderRepository for SqliteProviderRepository {
         })?;
 
         Ok(Provider {
+            gateway: params.gateway.map(String::from),
+            header_credentials_encrypted: params.header_credentials_encrypted.map(String::from),
+            model_mode: params.model_mode.to_owned(),
             id,
             user_id: params.user_id.to_string(),
             platform: params.platform.to_string(),
@@ -114,7 +120,7 @@ impl IProviderRepository for SqliteProviderRepository {
                 platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_protocols = ?, model_enabled = ?, model_health = ?, \
-                model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
+                model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ?, model_mode = ?, gateway = ?, header_credentials_encrypted = ? \
              WHERE user_id = ? AND id = ?",
         )
         .bind(&merged.platform)
@@ -132,6 +138,9 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.bedrock_config)
         .bind(merged.is_full_url)
         .bind(merged.updated_at)
+        .bind(&merged.model_mode)
+        .bind(&merged.gateway)
+        .bind(&merged.header_credentials_encrypted)
         .bind(user_id)
         .bind(id)
         .execute(&self.pool)
@@ -164,6 +173,11 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provider {
     let now = aionui_common::now_ms();
     Provider {
+        gateway: params.gateway.map_or(existing.gateway, |v| v.map(String::from)),
+        header_credentials_encrypted: params
+            .header_credentials_encrypted
+            .map_or(existing.header_credentials_encrypted, |v| v.map(String::from)),
+        model_mode: params.model_mode.unwrap_or(&existing.model_mode).to_owned(),
         id: existing.id,
         user_id: existing.user_id,
         platform: params.platform.unwrap_or(&existing.platform).to_string(),
@@ -221,6 +235,9 @@ mod tests {
 
     fn sample_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic",
             id: None,
             user_id: USER_A,
             platform: "anthropic",

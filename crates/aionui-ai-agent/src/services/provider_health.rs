@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::probe_observation::{ProbeCompletion, ProbeObservation, SharedObservation};
 use crate::error::AgentError;
 use aion_agent::bootstrap::AgentBootstrap;
 use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
-use aion_agent::output::null_sink::NullSink;
 use aion_config::config::{CliArgs, Config};
 use aionui_api_types::{
     HealthStatus, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
@@ -16,10 +16,7 @@ use aionui_db::{IProviderRepository, models::Provider};
 use regex::Regex;
 use tracing::{info, warn};
 
-use crate::factory::aionrs::{
-    map_aionrs_provider, resolve_aionrs_url_and_compat_with_mode, resolve_bedrock_config,
-    resolve_model_compat_overrides,
-};
+use crate::factory::aionrs::resolve_bedrock_config;
 use crate::types::AionrsResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,6 +44,17 @@ impl ProviderHealthCheckService {
         user_id: &str,
         req: ProviderHealthCheckRequest,
     ) -> Result<ProviderHealthCheckResponse, AgentError> {
+        self.health_check_with_cancellation(user_id, req, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// Run a probe that can return an explicit cancellation result to its caller.
+    pub async fn health_check_with_cancellation(
+        &self,
+        user_id: &str,
+        req: ProviderHealthCheckRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ProviderHealthCheckResponse, AgentError> {
         if req.provider_id.trim().is_empty() {
             return Err(AgentError::bad_request("provider_id is required"));
         }
@@ -64,23 +72,15 @@ impl ProviderHealthCheckService {
             .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
         let config = self.resolve_probe_config(&row, model)?;
-        probe_resolved_provider(row.id, row.platform, config).await
+        probe_with_cancellation(row.id, row.platform, config, cancellation).await
     }
 
     fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AgentError> {
-        let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
-            .map_err(|e| AgentError::internal(e.to_string()))?;
-        let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
-        let model_overrides = resolve_model_compat_overrides(model_id, &row.model_settings)?;
-        let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
-            &row.platform,
-            &row.base_url,
-            &provider,
-            model_id,
-            row.is_full_url,
-            model_overrides.openai_api_mode,
-        );
-        compat_overrides.image_input = model_overrides.image_input;
+        let resolved = crate::factory::provider_connection::resolve(row, model_id, &self.encryption_key)?;
+        let provider = resolved.provider;
+        let api_key = resolved.api_key;
+        let base_url = resolved.base_url;
+        let compat_overrides = resolved.compat;
         let bedrock_config = if row.platform == "bedrock" {
             resolve_bedrock_config(row.bedrock_config.as_deref())
         } else {
@@ -114,8 +114,26 @@ impl ProviderHealthCheckService {
 pub async fn probe_resolved_provider(
     provider_id: String,
     platform: String,
-    mut config_extra: AionrsResolvedConfig,
+    config_extra: AionrsResolvedConfig,
 ) -> Result<ProviderHealthCheckResponse, AgentError> {
+    probe_with_cancellation(
+        provider_id,
+        platform,
+        config_extra,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn probe_with_cancellation(
+    provider_id: String,
+    platform: String,
+    mut config_extra: AionrsResolvedConfig,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ProviderHealthCheckResponse, AgentError> {
+    let legacy_deadline = config_extra.compat_overrides.gateway.is_none();
+    let observation = Arc::new(ProbeObservation::new());
+    let mut completion = ProbeCompletion(false);
     config_extra.max_tokens = Some(HEALTH_CHECK_MAX_TOKENS);
     config_extra.max_turns = Some(1);
     config_extra.max_tool_call_malformed_turns = Some(1);
@@ -132,22 +150,44 @@ pub async fn probe_resolved_provider(
         "Provider health check started"
     );
 
-    let mut engine = match build_probe_engine(config_extra).await {
+    let mut engine = match build_probe_engine(config_extra, observation.clone()).await {
         Ok(engine) => engine,
         Err(error) => {
             let message = format!("Aionrs probe bootstrap failed: {error}");
             let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, None);
             log_health_check_result(&response);
+            completion.0 = true;
             return Ok(response);
         }
     };
 
-    match tokio::time::timeout(
-        HEALTH_CHECK_TIMEOUT,
-        engine.run(HEALTH_CHECK_PROMPT, HEALTH_CHECK_MSG_ID),
-    )
-    .await
-    {
+    let outcome = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        outcome = async {
+            if legacy_deadline {
+                tokio::time::timeout(HEALTH_CHECK_TIMEOUT, engine.run(HEALTH_CHECK_PROMPT, HEALTH_CHECK_MSG_ID)).await
+            } else {
+                Ok(engine.run(HEALTH_CHECK_PROMPT, HEALTH_CHECK_MSG_ID).await)
+            }
+        } => Some(outcome),
+    };
+    let Some(outcome) = outcome else {
+        let mut response = unhealthy_response(
+            provider_id,
+            platform,
+            model,
+            started.elapsed(),
+            "Health check cancelled".into(),
+            None,
+        );
+        response.error_kind = Some(ProviderHealthCheckErrorKind::Cancelled);
+        response.first_event_ms = observation.first_event_ms();
+        log_health_check_result(&response);
+        completion.0 = true;
+        return Ok(response);
+    };
+    let response: Result<ProviderHealthCheckResponse, AgentError> = match outcome {
         Ok(Ok(result))
             if result.text.trim().is_empty() || result.stop_reason != aion_types::message::StopReason::EndTurn =>
         {
@@ -156,11 +196,12 @@ pub async fn probe_resolved_provider(
                 result.stop_reason
             );
             let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, None);
-            log_health_check_result(&response);
             Ok(response)
         }
         Ok(Ok(_)) => {
             let response = ProviderHealthCheckResponse {
+                first_event_ms: None,
+                slow_first_event: false,
                 provider_id,
                 platform,
                 model,
@@ -171,13 +212,30 @@ pub async fn probe_resolved_provider(
                 http_status: None,
                 timeout_stage: None,
             };
-            log_health_check_result(&response);
             Ok(response)
         }
         Ok(Err(error)) => {
-            let message = error.to_string();
-            let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, None);
-            log_health_check_result(&response);
+            let timeout_stage = match &error {
+                aion_agent::error::AgentError::Provider(aion_providers::ProviderError::Http(error))
+                    if error.is_timeout() =>
+                {
+                    Some(
+                        if error.is_connect() {
+                            "connect"
+                        } else {
+                            "request_or_read"
+                        }
+                        .into(),
+                    )
+                }
+                _ => None,
+            };
+            let message = if timeout_stage.is_some() {
+                "Provider request timed out".into()
+            } else {
+                error.to_string()
+            };
+            let response = unhealthy_response(provider_id, platform, model, started.elapsed(), message, timeout_stage);
             Ok(response)
         }
         Err(_) => {
@@ -189,10 +247,15 @@ pub async fn probe_resolved_provider(
                 format!("Health check timeout ({}s)", HEALTH_CHECK_TIMEOUT.as_secs()),
                 Some("engine_run".into()),
             );
-            log_health_check_result(&response);
             Ok(response)
         }
-    }
+    };
+    completion.0 = true;
+    let mut response = response?;
+    response.first_event_ms = observation.first_event_ms();
+    response.slow_first_event = response.first_event_ms.is_some_and(|ms| ms >= 10_000);
+    log_health_check_result(&response);
+    Ok(response)
 }
 
 fn log_health_check_result(response: &ProviderHealthCheckResponse) {
@@ -202,6 +265,9 @@ fn log_health_check_result(response: &ProviderHealthCheckResponse) {
             platform = %response.platform,
             model = %response.model,
             elapsed_ms = response.elapsed_ms,
+            first_event_ms = ?response.first_event_ms,
+            slow_first_event = response.slow_first_event,
+            end_state = "completed",
             "Provider health check succeeded"
         ),
         HealthStatus::Unhealthy | HealthStatus::Unknown => warn!(
@@ -217,13 +283,16 @@ fn log_health_check_result(response: &ProviderHealthCheckResponse) {
     }
 }
 
-async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentEngine, AgentError> {
+async fn build_probe_engine(
+    config_extra: AionrsResolvedConfig,
+    observation: SharedObservation,
+) -> Result<AgentEngine, AgentError> {
     let workspace = config_extra
         .session_directory
         .parent()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let sink: Arc<dyn OutputSink> = Arc::new(NullSink);
+    let sink: Arc<dyn OutputSink> = observation;
     let cli_args = CliArgs {
         provider: Some(config_extra.provider),
         api_key: Some(config_extra.api_key),
@@ -283,6 +352,8 @@ fn unhealthy_response(
     let error_kind = classify_error(&message, timeout_stage.is_some());
     let http_status = extract_http_status(&message);
     ProviderHealthCheckResponse {
+        first_event_ms: None,
+        slow_first_event: false,
         provider_id,
         platform,
         model,
@@ -305,6 +376,22 @@ pub(crate) fn classify_error(message: &str, is_timeout: bool) -> ProviderHealthC
     }
 
     let lower = message.to_lowercase();
+    if lower.contains("cancelled") || lower.contains("user aborted") {
+        return ProviderHealthCheckErrorKind::Cancelled;
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return ProviderHealthCheckErrorKind::Timeout;
+    }
+    if lower.contains("no complete answer") {
+        return ProviderHealthCheckErrorKind::EmptyResponse;
+    }
+    if lower.contains("incomplete")
+        || lower.contains("unexpected eof")
+        || lower.contains("error decoding response body")
+        || lower.contains("stream ended")
+    {
+        return ProviderHealthCheckErrorKind::Interrupted;
+    }
     if lower.contains("invalid authorization header") || lower.contains("invalid x-api-key header") {
         return ProviderHealthCheckErrorKind::InvalidAuthorizationHeader;
     }
@@ -404,6 +491,9 @@ mod tests {
 
     fn test_provider() -> Provider {
         Provider {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic".into(),
             id: "provider-1".to_owned(),
             user_id: TEST_USER_ID.to_owned(),
             platform: "anthropic".to_owned(),

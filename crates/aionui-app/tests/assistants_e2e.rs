@@ -304,6 +304,9 @@ async fn fixture() -> Fixture {
     // erroring out — mirroring a configured production setup.
     provider_repo
         .create(aionui_db::CreateProviderParams {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic",
             user_id: "system_default_user",
             id: None,
             platform: "openai",

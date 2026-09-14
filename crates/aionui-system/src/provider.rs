@@ -7,6 +7,8 @@ use aionui_db::{CreateProviderParams, IProviderRepository, UpdateProviderParams,
 use serde::de::DeserializeOwned;
 
 use crate::error::SystemError;
+#[path = "provider_gateway.rs"]
+mod gateway;
 
 /// Business logic for model provider CRUD with API key encryption/masking.
 #[derive(Clone)]
@@ -35,6 +37,18 @@ impl ProviderService {
     pub async fn create(&self, user_id: &str, req: CreateProviderRequest) -> Result<ProviderResponse, SystemError> {
         validate_create_request(&req)?;
 
+        if let Some(gateway) = &req.gateway {
+            gateway::validate_policy(gateway, &req.platform, &req.api_key)?;
+            validate_gateway_protocols(req.model_protocols.as_ref(), &req.model_settings)?;
+        }
+        let credentials = gateway::prepare(
+            req.gateway.as_ref(),
+            None,
+            None,
+            &req.header_credentials,
+            &self.encryption_key,
+        )?;
+        let gateway_json = serialize_opt(&req.gateway, "gateway")?;
         let encrypted_key = encrypt_string(&req.api_key, &self.encryption_key)?;
         let models_json = serialize_json(&req.models, "models")?;
         let capabilities_json = serialize_json(&req.capabilities, "capabilities")?;
@@ -46,6 +60,9 @@ impl ProviderService {
         let trimmed_id = req.id.as_deref().map(str::trim);
 
         let params = CreateProviderParams {
+            gateway: gateway_json.as_deref(),
+            header_credentials_encrypted: credentials.as_deref(),
+            model_mode: mode_name(req.model_mode),
             id: trimmed_id,
             user_id,
             platform: &req.platform,
@@ -76,7 +93,83 @@ impl ProviderService {
         req: UpdateProviderRequest,
     ) -> Result<ProviderResponse, SystemError> {
         validate_update_request(&req)?;
+        let existing = self
+            .repo
+            .find_by_id(user_id, id)
+            .await?
+            .ok_or_else(|| SystemError::NotFound("Provider not found".into()))?;
+        let manual = req.model_mode.map(mode_name).unwrap_or(&existing.model_mode) == "manual";
+        if manual {
+            let models: Vec<String> = serde_json::from_str(&existing.models)
+                .map_err(|_| SystemError::Internal("Invalid stored models".into()))?;
+            validate_manual(
+                req.platform.as_deref().unwrap_or(&existing.platform),
+                req.base_url.as_deref().unwrap_or(&existing.base_url),
+                req.models.as_deref().unwrap_or(&models),
+                req.is_full_url.unwrap_or(existing.is_full_url),
+            )?;
+            let protocols = req
+                .model_protocols
+                .clone()
+                .or(deserialize_opt(&existing.model_protocols, "model_protocols")?);
+            let settings = req.model_settings.clone().unwrap_or(
+                serde_json::from_str(&existing.model_settings)
+                    .map_err(|_| SystemError::Internal("Invalid model settings".into()))?,
+            );
+            validate_gateway_protocols(protocols.as_ref(), &settings)?;
+        }
 
+        if req.clear_gateway && (req.gateway.is_some() || !req.header_credentials.is_empty()) {
+            return Err(SystemError::BadRequest(
+                "clear_gateway conflicts with gateway or credential updates".into(),
+            ));
+        }
+        let previous_gateway = gateway::read_gateway(existing.gateway.as_deref())?;
+        let gateway = if req.clear_gateway {
+            None
+        } else {
+            req.gateway.clone().or(previous_gateway.clone())
+        };
+        if let Some(gateway) = &gateway {
+            let api_key = match &req.api_key {
+                Some(key) => key.clone(),
+                None => decrypt_string(&existing.api_key_encrypted, &self.encryption_key)?,
+            };
+            gateway::validate_policy(gateway, req.platform.as_deref().unwrap_or(&existing.platform), &api_key)?;
+            let protocols = req
+                .model_protocols
+                .clone()
+                .or(deserialize_opt(&existing.model_protocols, "model_protocols")?);
+            let settings = req.model_settings.clone().unwrap_or(
+                serde_json::from_str(&existing.model_settings)
+                    .map_err(|_| SystemError::Internal("Invalid model settings".into()))?,
+            );
+            validate_gateway_protocols(protocols.as_ref(), &settings)?;
+        }
+        if req.clear_gateway {
+            let api_key = match &req.api_key {
+                Some(key) => key.clone(),
+                None => decrypt_string(&existing.api_key_encrypted, &self.encryption_key)?,
+            };
+            if api_key.trim().is_empty() {
+                return Err(SystemError::BadRequest(
+                    "Restoring default Bearer authentication requires apiKey".into(),
+                ));
+            }
+        }
+        let gateway_changed = req.clear_gateway || req.gateway.is_some() || !req.header_credentials.is_empty();
+        let credentials = if req.clear_gateway {
+            None
+        } else {
+            gateway::prepare(
+                gateway.as_ref(),
+                existing.header_credentials_encrypted.as_deref(),
+                previous_gateway.as_ref(),
+                &req.header_credentials,
+                &self.encryption_key,
+            )?
+        };
+        let gateway_json = serialize_opt(&gateway, "gateway")?;
         let encrypted_key = req
             .api_key
             .as_deref()
@@ -91,6 +184,9 @@ impl ProviderService {
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
 
         let params = UpdateProviderParams {
+            gateway: gateway_changed.then_some(gateway_json.as_deref()),
+            header_credentials_encrypted: gateway_changed.then_some(credentials.as_deref()),
+            model_mode: req.model_mode.map(mode_name),
             platform: req.platform.as_deref(),
             name: req.name.as_deref(),
             base_url: req.base_url.as_deref(),
@@ -160,6 +256,16 @@ impl ProviderService {
         let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
 
         Ok(ProviderResponse {
+            gateway: gateway::public_gateway(
+                row.gateway.as_deref(),
+                row.header_credentials_encrypted.as_deref(),
+                &self.encryption_key,
+            )?,
+            model_mode: if row.model_mode == "manual" {
+                aionui_api_types::ProviderModelMode::Manual
+            } else {
+                aionui_api_types::ProviderModelMode::Automatic
+            },
             id: row.id,
             platform: row.platform,
             name: row.name,
@@ -214,6 +320,10 @@ pub(crate) fn deserialize_opt<T: DeserializeOwned>(
 // ---------------------------------------------------------------------------
 
 fn validate_create_request(req: &CreateProviderRequest) -> Result<(), SystemError> {
+    if req.model_mode == aionui_api_types::ProviderModelMode::Manual {
+        validate_manual(&req.platform, &req.base_url, &req.models, req.is_full_url)?;
+        validate_gateway_protocols(req.model_protocols.as_ref(), &req.model_settings)?;
+    }
     if let Some(ref id) = req.id {
         validate_id(id)?;
     }
@@ -236,7 +346,12 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), SystemErro
         }
     } else {
         validate_base_url(&req.base_url)?;
-        if req.api_key.trim().is_empty() {
+        if req.api_key.trim().is_empty()
+            && !req
+                .gateway
+                .as_ref()
+                .is_some_and(|g| g.auth == aionui_api_types::GatewayAuth::None)
+        {
             return Err(SystemError::BadRequest("apiKey is required".into()));
         }
     }
@@ -326,6 +441,9 @@ mod tests {
 
     fn sample_create_request() -> CreateProviderRequest {
         CreateProviderRequest {
+            gateway: None,
+            header_credentials: Default::default(),
+            model_mode: Default::default(),
             id: None,
             platform: "anthropic".into(),
             name: "Anthropic".into(),
@@ -727,6 +845,9 @@ mod undecryptable_row_tests {
             .create(
                 USER,
                 CreateProviderRequest {
+                    gateway: None,
+                    header_credentials: Default::default(),
+                    model_mode: Default::default(),
                     id: Some("prov-good".into()),
                     platform: "custom".into(),
                     name: "Good".into(),
@@ -750,6 +871,9 @@ mod undecryptable_row_tests {
             .create(
                 USER,
                 CreateProviderRequest {
+                    gateway: None,
+                    header_credentials: Default::default(),
+                    model_mode: Default::default(),
                     id: Some("prov-bad".into()),
                     platform: "custom".into(),
                     name: "Bad".into(),
@@ -785,4 +909,56 @@ mod undecryptable_row_tests {
         assert_eq!(good_row.api_key, "sk-good", "healthy rows keep decrypting");
         assert_eq!(bad_row.api_key, "", "undecryptable row degrades to an empty key");
     }
+}
+
+fn mode_name(mode: aionui_api_types::ProviderModelMode) -> &'static str {
+    match mode {
+        aionui_api_types::ProviderModelMode::Manual => "manual",
+        aionui_api_types::ProviderModelMode::Automatic => "automatic",
+    }
+}
+
+fn validate_manual(platform: &str, url: &str, models: &[String], full: bool) -> Result<(), SystemError> {
+    if !matches!(platform, "custom" | "openai") {
+        return Err(SystemError::BadRequest(
+            "Manual mode requires a custom OpenAI connection".into(),
+        ));
+    }
+    if !full {
+        return Err(SystemError::BadRequest("Manual mode requires is_full_url".into()));
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| SystemError::BadRequest("Invalid manual endpoint".into()))?;
+    if url.trim() != url
+        || !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(SystemError::BadRequest(
+            "Manual endpoint must be an HTTP URL without userinfo or fragment".into(),
+        ));
+    }
+    if models.is_empty() || models.iter().any(|m| m.trim().is_empty() || m.trim() != m) {
+        return Err(SystemError::BadRequest(
+            "Manual mode requires non-empty model IDs".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_protocols(
+    protocols: Option<&HashMap<String, String>>,
+    settings: &HashMap<String, aionui_api_types::ModelSettings>,
+) -> Result<(), SystemError> {
+    if protocols.is_some_and(|p| p.values().any(|v| v != "openai"))
+        || settings
+            .values()
+            .any(|s| s.openai_api_mode == Some(aionui_api_types::ModelOpenAiApiMode::Responses))
+    {
+        return Err(SystemError::BadRequest(
+            "Gateway options require Chat Completions".into(),
+        ));
+    }
+    Ok(())
 }

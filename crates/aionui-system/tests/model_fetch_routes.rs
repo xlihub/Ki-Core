@@ -69,6 +69,9 @@ async fn create_provider(db: &aionui_db::Database, platform: &str, base_url: &st
     let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
     let row = repo
         .create(CreateProviderParams {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic",
             user_id: TEST_USER_ID,
             id: None,
             platform,

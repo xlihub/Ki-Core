@@ -70,3 +70,23 @@ async fn migration_027_rejects_invalid_model_settings_json() {
 
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn migration_043_preserves_old_connections_and_is_repeatable() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 42).await;
+    sqlx::query("INSERT INTO providers (id,user_id,platform,name,base_url,api_key_encrypted,created_at,updated_at) VALUES ('legacy','system_default_user','custom','Legacy','https://example.com/v1','ciphertext',1,1)").execute(&pool).await.unwrap();
+    run_migrations_through(&pool, 43).await;
+    run_migrations_through(&pool, 43).await;
+    let row: (String, Option<String>, Option<String>, String) = sqlx::query_as(
+        "SELECT model_mode,gateway,header_credentials_encrypted,base_url FROM providers WHERE id='legacy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("automatic".into(), None, None, "https://example.com/v1".into()));
+}

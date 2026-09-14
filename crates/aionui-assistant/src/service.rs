@@ -3767,6 +3767,9 @@ mod tests {
 
     async fn seed_provider_for_user(repo: &dyn IProviderRepository, user_id: &str, platform: &str) {
         repo.create(CreateProviderParams {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic",
             id: None,
             user_id,
             platform,
@@ -6850,6 +6853,9 @@ mod tests {
         // must still error out because no enabled provider exists.
         fx.provider_repo
             .create(CreateProviderParams {
+                gateway: None,
+                header_credentials_encrypted: None,
+                model_mode: "automatic",
                 id: None,
                 user_id: DEFAULT_USER_ID,
                 platform: "anthropic",

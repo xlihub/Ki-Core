@@ -8,11 +8,29 @@ use crate::protocol::events::{
 
 pub struct BackendOutputSink {
     event_tx: broadcast::Sender<AgentStreamEvent>,
+    first_output_started: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl BackendOutputSink {
     pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+        Self {
+            event_tx,
+            first_output_started: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn observe_first_output(&self) {
+        if let Some(started) = self
+            .first_output_started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            tracing::info!(
+                first_event_ms = started.elapsed().as_millis() as u64,
+                "Provider first output event"
+            );
+        }
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
@@ -27,12 +45,14 @@ impl BackendOutputSink {
 
 impl OutputSink for BackendOutputSink {
     fn emit_text_delta(&self, text: &str, _msg_id: &str) {
+        self.observe_first_output();
         let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
             content: text.to_owned(),
         }));
     }
 
     fn emit_thinking(&self, text: &str, _msg_id: &str) {
+        self.observe_first_output();
         let _ = self.event_tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
             content: text.to_owned(),
             subject: None,
@@ -42,6 +62,7 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_call(&self, tool_use_id: &str, name: &str, input: &str) {
+        self.observe_first_output();
         let Some(call_id) = Self::internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_call with empty tool_use_id");
             return;
@@ -121,6 +142,7 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_stream_start(&self, _msg_id: &str) {
+        *self.first_output_started.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         let _ = self
             .event_tx
             .send(AgentStreamEvent::Start(StartEventData { session_id: None }));
@@ -130,11 +152,18 @@ impl OutputSink for BackendOutputSink {
         &self,
         _msg_id: &str,
         _turns: usize,
-        _input_tokens: u64,
-        _output_tokens: u64,
-        _cache_creation_tokens: u64,
-        _cache_read_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     ) {
+        tracing::info!(
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            "Provider turn usage"
+        );
         let _ = self
             .event_tx
             .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));

@@ -70,7 +70,7 @@ pub use runtime_token::{
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
 pub use services::RemoteAgentService;
-pub use services::provider_health::probe_resolved_provider;
+pub use services::provider_health::{ProviderHealthCheckService, probe_resolved_provider};
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,
     WorkspaceContext,

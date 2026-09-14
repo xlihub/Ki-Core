@@ -99,6 +99,11 @@ impl ProtocolDetectionService {
     }
 
     pub async fn detect_protocol(&self, req: &DetectProtocolRequest) -> Result<ProtocolDetectionResponse, SystemError> {
+        if req.model_mode == aionui_api_types::ProviderModelMode::Manual {
+            return Err(SystemError::BadRequest(
+                "Protocol detection is disabled in manual mode".into(),
+            ));
+        }
         validate_request(req)?;
 
         let keys = parse_keys(&req.api_key);
@@ -678,6 +683,7 @@ mod tests {
     #[test]
     fn validate_empty_base_url() {
         let req = DetectProtocolRequest {
+            model_mode: Default::default(),
             base_url: "  ".into(),
             api_key: "sk-test".into(),
             timeout: None,
@@ -690,6 +696,7 @@ mod tests {
     #[test]
     fn validate_empty_api_key() {
         let req = DetectProtocolRequest {
+            model_mode: Default::default(),
             base_url: "https://api.example.com".into(),
             api_key: "  ".into(),
             timeout: None,
@@ -702,6 +709,7 @@ mod tests {
     #[test]
     fn validate_ok() {
         let req = DetectProtocolRequest {
+            model_mode: Default::default(),
             base_url: "https://api.example.com".into(),
             api_key: "sk-test".into(),
             timeout: None,

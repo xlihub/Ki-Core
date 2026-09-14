@@ -12,14 +12,15 @@
 | --- | --- |
 | `auth` | `bearer`；`none` 时 SDK 不生成 Bearer，允许 API key 为空 |
 | `headers` | 名称/值二元组列表；保留重复输入交给 SDK 校验，不能存放 client 隐式鉴权 |
+| `proxy` | `default` 保留 reqwest 默认代理发现；`direct` 对当前 client 调用 `no_proxy()` |
 | `include_stream_options` | 未设置时保留已有 compat；false 时不发送 `stream_options` |
-| `connect_timeout_ms` | 未设置为 10000；显式设置必须大于零 |
-| `read_timeout_ms` | 未设置为 30000；每次网络读取等待上限，显式设置必须大于零 |
-| `request_timeout_ms` | 未设置时无总请求上限；显式设置必须大于零 |
+| `connect_timeout_ms` | 未设置为 10000；范围 1–300000 毫秒 |
+| `read_timeout_ms` | 未设置为 30000；每次网络读取等待上限，范围 1–3600000 毫秒 |
+| `request_timeout_ms` | 未设置时无总请求上限；范围 1–3600000 毫秒 |
 
-`api_key`、`base_url`、`model` 及 `compat_overrides.api_path`、`max_tokens_field` 继续使用已有字段。`api_path = Some("")` 表示完整 URL，保留查询参数和末尾斜线；否则由 SDK 拼接路径。其余 SDK `ProviderCompat` 原样传递。Core 构造 client 时禁用重定向和 reqwest 底层重试，保留系统代理及 TLS 策略；SDK 自身的有限重试仍按 SDK 契约执行，已输出内容后不得重放。
+`api_key`、`base_url`、`model` 及 `compat_overrides.api_path`、`max_tokens_field` 继续使用已有字段。`api_path = Some("")` 表示完整 URL，保留查询参数和末尾斜线；否则由 SDK 拼接路径。其余 SDK `ProviderCompat` 原样传递。Core 构造 client 时禁用重定向和 reqwest 底层重试，按连接选择默认代理发现或直连，并保留 TLS 策略；SDK 自身的有限重试仍按 SDK 契约执行，已输出内容后不得重放。
 
-后续配置/凭据工单负责 API schema、保存与校验、加密、解密和权限。当前 gateway 字段承载已解析数据；附加头值必须视为凭据，不能直接放入公共设置或日志。`GatewayConfig::Debug` 仅显示鉴权模式、头数量和网络选项，不显示头名或值。
+API 与持久化契约见下节。运行时 gateway 字段只承载从当前用户 provider 记录解析的数据；附加头值必须视为凭据，不能直接放入公共设置或日志。`GatewayConfig::Debug` 仅显示鉴权模式、头数量和网络选项，不显示头名或值。
 
 ## 错误和 Agent 结果
 
@@ -27,7 +28,7 @@
 
 HTTP 请求与流错误遵循 SDK `ProviderError`。SDK 会脱敏已配置 key 和附加头值，但不承诺删除任意服务端响应正文。Core 不解析原始 SSE，也不重新实现消息或事件转换。
 
-SDK 可能在触发轮次上限时返回空文本和 `Ok(AgentResult)`。Core 将模型调用后的空答案和非 `EndTurn` 结果视为失败，避免返回成功或继续发出 `Finish`。成功本地命令返回 `turns=0`、空文本和 `EndTurn`，保留其原有语义。`OutputSink::emit_error` 也用于可继续执行的诊断，Core 不用它推断 Agent 的结束状态。健康检查保留 16 token、单次计数轮次和 30 秒总预算，并检查结果内容与结束状态。用户取消仍按已有停止语义结束界面流，不表示模型成功回答。
+SDK 可能在触发轮次上限时返回空文本和 `Ok(AgentResult)`。Core 将模型调用后的空答案和非 `EndTurn` 结果视为失败，避免返回成功或继续发出 `Finish`。成功本地命令返回 `turns=0`、空文本和 `EndTurn`，保留其原有语义。`OutputSink::emit_error` 也用于可继续执行的诊断，Core 不用它推断 Agent 的结束状态。健康检查保留 16 token 和单次计数轮次，并检查结果内容与结束状态。没有 gateway 时保留 30 秒预算；有 gateway 时使用该连接的 HTTP 超时策略，不额外套用固定 30 秒限制。用户取消仍按已有停止语义结束界面流，不表示模型成功回答。
 
 ## 依赖与发布来源
 
@@ -52,3 +53,97 @@ python3 scripts/ki-core-release/validate-model-pin.py
 集成测试只使用临时目录、本机随机端口、合成模型和凭据。覆盖真实 Core Agent 的自定义完整 URL、Bearer 与仅头鉴权、首文本时序、内置 Read 执行、tool_call_id 与 opaque metadata 回传、后续回答和恢复；同时覆盖健康检查、空结果、错误脱敏、截断/空流、取消、读取超时和输出后不重放。无高级配置与显式默认 options 的请求/事件兼容性单独比较。SSE 的合法 EOF、工具 schema 等细节服从 SDK 契约，不继承已废除的 Core 自定义实现规则。
 
 已核对的 SDK 依据（相对于 Ki-Model 仓库）：`docs/ki-model/openai-gateway.md`、`crates/aion-providers/src/openai.rs`、`openai_options.rs`、`provider.rs`、`stream_process.rs`、`stream_runner.rs`、`transport.rs`，以及 `crates/aion-agent/src/engine.rs` 和 `output/sink.rs`。
+
+
+## Provider API 与桌面消费契约（#22–#25）
+
+沿用 `/api/providers` 的 POST/GET 与 `/api/providers/{id}` 的 PUT/DELETE、现有用户隔离、认证及 CSRF 保护。没有新增客户或协议入口。类型位于 `aionui-api-types/src/provider_gateway.rs` 和 `provider.rs`。
+
+| 字段 | 创建 / 读取 | 更新与兼容语义 |
+| --- | --- | --- |
+| `model_mode` | `automatic`（默认）或 `manual` | 不传保留；开启 gateway 不改变 mode |
+| `base_url`、`models`、`is_full_url` | 复用既有字段 | manual 要求 custom/openai、HTTP(S) 完整地址、`is_full_url=true` 与非空模型 ID；运行时保留地址和请求模型，拒绝未配置模型 |
+| `gateway` | 可选；缺失/null 保留旧 SDK 默认路径；`{}` 显式采用下方 gateway 默认值 | 不传/null 保留；提供对象替换整个非敏感配置（不是递归合并） |
+| `gateway.auth` | `bearer` 默认，凭据仅来自现有加密 API Key；`none` 不附加 Bearer，API Key 可不传或为空 | 开启 Bearer 必须提供有效 API Key；自定义 Authorization 与 Bearer 大小写不敏感地判冲突 |
+| `gateway.headers` | 任意头名数组，每项为 `name`、普通值 `value` 或 `sensitive=true` | 整个数组替换；删除条目会删除其凭据；重复头、传输保留头、非法名称/值报 400 |
+| `header_credentials` | 仅写请求使用，key 为大小写不敏感的头名 | 不传保留；`{action:keep}` 保留已有值；`{action:replace,value:...}` 替换；`{action:clear}` 清除 |
+| `gateway.headers[].configured` | 服务端计算的只读布尔值；敏感头不返回 value | 输入不参与凭据判断，不把星号或圆点掩码写成真实凭据 |
+| `gateway.include_stream_options` | null 继承 SDK compat；false 不发送；true 发送 `include_usage:true` | 由 SDK 请求投影处理，Core 不拼请求 JSON |
+| `clear_gateway` | 仅 PUT 使用 | true 清除 gateway 和新增凭据，恢复旧 Bearer 行为；要求已有/同时提供 API Key；与 gateway/凭据修改冲突时报 400 |
+
+`gateway` 和 manual 只适用于 Chat Completions；与 Responses 或其他模型协议配置冲突时报 400。普通连接仍沿用原有自动发现。manual 的保存、编辑及按 ID 获取模型不做探测；`POST /api/providers/{id}/models` 返回已有 models，不重复存储静态模型。创建前的 `/fetch-models` 请求带 `model_mode:manual` 时返回该请求中的 models；`/detect-protocol` 带同一 mode 时明确返回 400，均不联网。
+
+写入示例（所有值为合成数据）：
+
+```json
+{
+  "platform": "custom",
+  "name": "Local gateway",
+  "base_url": "http://127.0.0.1:9000/custom/invoke/",
+  "model_mode": "manual",
+  "models": ["synthetic-model"],
+  "is_full_url": true,
+  "gateway": {
+    "auth": "none",
+    "proxy": "direct",
+    "include_stream_options": false,
+    "headers": [
+      {"name": "X-Tenant", "value": "synthetic-tenant"},
+      {"name": "X-Secret", "sensitive": true}
+    ]
+  },
+  "header_credentials": {
+    "X-Secret": {"action": "replace", "value": "synthetic-secret"}
+  }
+}
+```
+
+新增敏感头声明时必须同时写入凭据，或显式 clear 保存为未配置状态。clear 后该头的 configured=false，聊天/恢复/健康检查在联网前报缺失凭据；名称等普通保存不误删凭据。替换验证和加密在数据库写入前完成；失败不更新记录。通过 service 加密边界注入 RNG/AES 故障，已验证创建不产生记录、更新不改写原值，错误响应不含加密内部详情。并发更新使用已验证记录的 updated_at 检查并执行条件写入；过期请求返回 409，重新读取后可重试，避免覆盖其他请求刚保存的凭据。凭据按 AES-256-GCM 加密为独立列，公开 gateway JSON 只存元数据与普通值。解密失败明确报错、不回显密文；可用 clear_gateway 恢复。现有 API Key 继续采用原有加密及读写兼容语义（旧 API 明文返回约定未改变）。
+
+migration 043 为已有连接设置 automatic、gateway/凭据为空，不重写历史 migration。其他基础 DTO/row 初始化位置只添加默认值。
+
+## 网络策略、结果和观测
+
+所有超时单位都是毫秒。gateway 初始值为 connect=10000、read=30000、request=null。connect 范围 1–300000，覆盖建立连接（模拟 TLS 握手停滞已验证）；read 范围 1–3600000，每次网络读取重新计时；request 范围 1–3600000，覆盖一次 HTTP 尝试从连接至响应体结束，不是完整多轮 Agent 任务预算。SDK 有界重试仍可能使总耗时超过单次 request 预算。聊天与健康检查都由同一 resolver 和 create_provider 解析并创建 client。
+
+`default` 使用当前 reqwest 构建的默认代理发现，不承诺所有操作系统代理来源均可用；`direct` 禁用当前 client 的代理。没有修改进程环境或全局 client。依赖依据是 reqwest 0.12.28 的 `ClientBuilder::no_proxy/connect_timeout/read_timeout/timeout`；实际环境代理行为由测试子进程分别设置 HTTP_PROXY/NO_PROXY 验证，避免影响其他测试。Windows 的系统代理、PAC、WinHTTP/WinINET 等来源仍需目标机器验证，桌面文案不能将 default 描述为“支持所有系统代理”。
+
+健康检查新增 `first_event_ms`（开始检查至 SDK 首次输出文本、reasoning 或工具事件，包含 bootstrap 时间），`slow_first_event`（>=10000ms）。慢首事件可同时为 healthy；取消、超时、中断、空结果和 HTTP 错误分别使用 error_kind。服务调用方可通过 `health_check_with_cancellation` 的 CancellationToken 取得 cancelled；HTTP 调用被丢弃时记录取消并释放检查 future，已断开的客户端不会收到响应。
+
+Core INFO 日志记录 provider/model、只含 origin 的 endpoint（不含路径/查询参数）、代理/超时策略、首输出耗时、结束状态与 usage。HTTP 错误状态通过健康结果和现有 SDK 日志提供；SDK 正常流 HTTP 状态摘要在 DEBUG、异常摘要在 WARN。所有新增日志不输出提示词、工具内容、API Key 或新增凭据。SDK 负责已配置鉴权值的错误脱敏。
+
+### SDK 后续工作与目标环境验证
+
+- 现场响应离线回放发现 SDK 错误契约仍不足：HTTP 202 携带 `errcode/errmsg` 的业务拒绝，在当前 Core 健康检查中被报告为 interrupted，且 SDK 发送 3 次请求；HTTP 200 的非 JSON 文本 SSE 错误统一为 api_error / Invalid JSON，鉴权、模型及参数拒绝原因丢失。均未误报成功，但不能据此将 #23/#25 的错误可辨识验收标为通过。维护者已将这类错误识别、重试及下述流超时类型问题统一转交 [Ki-Model #11](https://github.com/xlihub/Ki-Model/issues/11#issuecomment-5659161383)，不阻塞本次 Core 成功调用链路开发。后续通过正式 SDK 修复版本提供业务错误、真实 HTTP 状态及正确重试属性，再更新 Core 固定 pin；Core 不写死客户错误码或文本。
+
+- Windows 目标环境未验证。macOS 的受控代理测试和跨平台可编译源码不能替代此项。
+- Ki-Model 0.1.1 `crates/aion-providers/src/stream_process.rs` 在 body read 失败时调用 `e.without_url().to_string()`，丢失 reqwest `is_timeout()`。因此已开始的流读取超时目前会停止请求并报告 interrupted，不能可靠地细分为 timeout；不能根据耗时猜测错误类型。握手/首响应等待阶段保留 typed error，能够报告 timeout，并给出 connect 或 request_or_read。精确区分 body read 超时需要正式 SDK 扩展后再升级固定 pin。现有测试明确记录这一限制。
+
+## 本次验证入口
+
+```bash
+cargo test -p aionui-system --test provider_routes --locked
+cargo test -p aionui-db --test provider_model_settings_migration --locked
+cargo test -p aionui-ai-agent --test factory_provider_integration --locked
+cargo test -p aionui-ai-agent --test gateway_provider --locked
+cargo test -p aionui-app --test agent_provider_health_e2e --locked
+cargo check --workspace --tests --locked
+cargo clippy --workspace --tests --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+新测试覆盖 API 到已保存配置再到真实 HTTP 请求、真实 factory 新建/恢复、Bearer 与多个头并存及切换、stream_options 更新、31 秒首事件、握手/请求/流空闲策略、取消、截断、鉴权失败与脱敏、用户隔离、磁盘数据库重开及旧迁移兼容。健康检查完整 HTTP 路由测试复用现有认证/CSRF 测试组。
+
+## 现场交叉核对（2026-09-14）
+
+已核对现场 ZIP 的 SHA-256（`0c6af895c89e2d64f07b2ba19e667fa254d4259e761237d7c069b0cdc5a9fe7e`）、CRC，以及 21 组 result/summary 与原始 body 长度。现场完整 URL、请求模型与响应别名不同、仅请求头鉴权及附加 Bearer 的行为与通用配置设计一致；原始数据和凭据不加入仓库。
+
+当前 Core 经临时离线测试，把 7 组原始响应交给本机 HTTP mock，通过实际 ProviderService 持久化配置、ProviderHealthCheckService 和固定 SDK 执行：08 普通流、13 stream_options、14 健康检查均 healthy；03/04/17/20 的结果见上述未完成项。只回放响应，不联系客户地址，不复用客户凭据，不模拟原始网络时序；不能把这一结果称为真实 Core 客户端的现场验收。
+
+现场 `stream_options.include_usage=true` 已成功；未携带该字段时也返回 usage，不能将关闭选项描述为必需兼容措施。现场 SystemProxy 成功时目标实际绕过代理，不能替代本机受控代理测试或 Windows reqwest 验证。现场正常健康请求完成于 293ms，也不能覆盖生产慢响应、负载或长流策略。
+
+### 真实 Core 进程连接现场协议 mock
+
+2026-09-14 已从功能分支构建真实 aioncore 二进制，启动独立数据目录的本机 HTTP 服务，连接 KiBuddy 现场协议 mock 的 field 模式。通过公开 Core API 创建 manual 连接并保存三项敏感头，验证模型读取不发现、健康检查、普通聊天、真实 Read 工具及结果回传；随后完全停止并重启 Core，用同一数据目录恢复同一会话继续聊天，再分别打开/关闭 Bearer 与 stream_options。
+
+mock 共记录 8 次完整的 HTTP 200 请求，完整路径、请求模型和三项鉴权全部匹配。真实 Read 工具读取了本次随机生成的文件内容；持久化的最终 assistant text 为 finish 且包含该内容。磁盘 gateway 元数据与凭据密文中不含三项明文。全部使用公开 mock 凭据、本机随机端口和独立测试数据；服务验证后正常停止。本机真实进程验证仍不替代 Windows 和客户正式包验收。

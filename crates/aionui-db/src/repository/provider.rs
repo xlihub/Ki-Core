@@ -26,6 +26,10 @@ pub trait IProviderRepository: Send + Sync {
 /// Parameters for creating a new provider.
 #[derive(Debug)]
 pub struct CreateProviderParams<'a> {
+    pub gateway: Option<&'a str>,
+    pub header_credentials_encrypted: Option<&'a str>,
+
+    pub model_mode: &'a str,
     /// Optional caller-supplied id. When `None`, the repository generates one.
     pub id: Option<&'a str>,
     pub user_id: &'a str,
@@ -50,6 +54,12 @@ pub struct CreateProviderParams<'a> {
 /// All fields are optional; `None` means "keep the current value".
 #[derive(Debug, Default)]
 pub struct UpdateProviderParams<'a> {
+    /// Reject updates whose validated snapshot has since changed.
+    pub expected_updated_at: Option<i64>,
+    pub gateway: Option<Option<&'a str>>,
+    pub header_credentials_encrypted: Option<Option<&'a str>>,
+
+    pub model_mode: Option<&'a str>,
     pub platform: Option<&'a str>,
     pub name: Option<&'a str>,
     pub base_url: Option<&'a str>,

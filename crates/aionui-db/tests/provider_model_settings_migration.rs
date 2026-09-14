@@ -12,15 +12,25 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
         .filter(|migration| migration.version <= max_version)
         .cloned()
         .collect::<Vec<_>>();
-    Migrator {
+    let mut conn = pool.acquire().await.unwrap();
+    // Match production setup for historical table rebuilds, outside migration transactions.
+    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let result = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
         locking: true,
         no_tx: false,
     }
-    .run(pool)
-    .await
-    .unwrap();
+    .run(&mut *conn)
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]
@@ -69,4 +79,24 @@ async fn migration_027_rejects_invalid_model_settings_json() {
     .await;
 
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn migration_043_preserves_old_connections_and_is_repeatable() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 42).await;
+    sqlx::query("INSERT INTO providers (id,user_id,platform,name,base_url,api_key_encrypted,created_at,updated_at) VALUES ('legacy','system_default_user','custom','Legacy','https://example.com/v1','ciphertext',1,1)").execute(&pool).await.unwrap();
+    run_migrations_through(&pool, 43).await;
+    run_migrations_through(&pool, 43).await;
+    let row: (String, Option<String>, Option<String>, String) = sqlx::query_as(
+        "SELECT model_mode,gateway,header_credentials_encrypted,base_url FROM providers WHERE id='legacy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("automatic".into(), None, None, "https://example.com/v1".into()));
 }

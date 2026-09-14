@@ -43,6 +43,9 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
     let key = test_encryption_key();
     let encrypted_api_key = encrypt_string("sk-test-key-12345", &key).unwrap();
     repo.create(CreateProviderParams {
+        gateway: None,
+        header_credentials_encrypted: None,
+        model_mode: "automatic",
         id: Some(id),
         user_id: TEST_USER_ID,
         platform,
@@ -199,3 +202,6 @@ async fn aionrs_factory_respects_use_model_override() {
     let result = factory(options).await;
     assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
 }
+
+#[path = "gateway/persisted.rs"]
+mod connection;

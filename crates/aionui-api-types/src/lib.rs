@@ -24,6 +24,10 @@ mod mcp;
 mod office;
 mod project;
 mod provider;
+mod provider_gateway;
+pub use provider_gateway::{
+    GatewayAuth, GatewayHeader, GatewayProxy, HeaderCredentialUpdate, HeaderCredentialUpdates, ProviderGateway,
+};
 mod remote_agent;
 mod response;
 mod runtime;
@@ -144,7 +148,7 @@ pub use provider::{
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,
     ModelHealthStatus, ModelImageInputCapability, ModelInfo, ModelOpenAiApiMode, ModelSettings, ModelType,
     MultiKeyResult, ProtocolDetectionResponse, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
-    ProviderHealthCheckResponse, ProviderResponse, SuggestionType, UpdateProviderRequest,
+    ProviderHealthCheckResponse, ProviderModelMode, ProviderResponse, SuggestionType, UpdateProviderRequest,
 };
 pub use remote_agent::{
     CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,

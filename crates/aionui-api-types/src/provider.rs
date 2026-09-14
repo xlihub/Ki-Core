@@ -2,7 +2,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::{HeaderCredentialUpdates, ProviderGateway};
 use aionui_common::ProtocolType;
+
+/// Model selection policy. Missing values preserve automatic discovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelMode {
+    #[default]
+    Automatic,
+    Manual,
+}
 
 /// Model capability type discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,6 +92,9 @@ pub struct ModelHealthStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHealthCheckErrorKind {
     Timeout,
+    Cancelled,
+    Interrupted,
+    EmptyResponse,
     InvalidAuthorizationHeader,
     Unauthorized,
     Forbidden,
@@ -105,6 +118,10 @@ pub struct ProviderHealthCheckRequest {
 /// Response body for `POST /api/agents/provider-health-check`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderHealthCheckResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_event_ms: Option<u64>,
+    #[serde(default)]
+    pub slow_first_event: bool,
     pub provider_id: String,
     pub platform: String,
     pub model: String,
@@ -149,6 +166,12 @@ pub struct BedrockConfig {
 /// local-store → backend migration; no masking applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<ProviderGateway>,
+
+    #[serde(default)]
+    pub model_mode: ProviderModelMode,
+
     pub id: String,
     pub platform: String,
     pub name: String,
@@ -179,6 +202,14 @@ pub struct ProviderResponse {
 /// Request body for `POST /api/providers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateProviderRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<ProviderGateway>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub header_credentials: HeaderCredentialUpdates,
+
+    #[serde(default)]
+    pub model_mode: ProviderModelMode,
+
     /// Optional caller-supplied id. When `None`, the server generates one.
     /// Lets callers preserve a locally-known id across the create boundary
     /// (used during the frontend-local-store → backend migration).
@@ -188,6 +219,7 @@ pub struct CreateProviderRequest {
     pub name: String,
     pub base_url: String,
     /// Plain-text API key (supports comma/newline-separated multi-keys).
+    #[serde(default)]
     pub api_key: String,
     #[serde(default)]
     pub models: Vec<String>,
@@ -220,6 +252,15 @@ fn default_true() -> bool {
 /// All fields are optional — partial update semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpdateProviderRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<ProviderGateway>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub header_credentials: HeaderCredentialUpdates,
+    #[serde(default)]
+    pub clear_gateway: bool,
+
+    pub model_mode: Option<ProviderModelMode>,
+
     pub platform: Option<String>,
     pub name: Option<String>,
     pub base_url: Option<String>,
@@ -250,6 +291,11 @@ pub struct FetchModelsRequest {
 /// the request body instead of looked up by id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchModelsAnonymousRequest {
+    #[serde(default)]
+    pub model_mode: ProviderModelMode,
+    #[serde(default)]
+    pub models: Vec<String>,
+
     pub platform: String,
     pub base_url: String,
     /// Plain-text API key (supports multi-key).
@@ -280,6 +326,9 @@ pub struct FetchModelsResponse {
 /// Request body for `POST /api/providers/detect-protocol`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectProtocolRequest {
+    #[serde(default)]
+    pub model_mode: ProviderModelMode,
+
     pub base_url: String,
     /// Plain-text API key (supports multi-key).
     pub api_key: String,
@@ -487,6 +536,8 @@ mod tests {
     #[test]
     fn test_provider_response_serialization() {
         let resp = ProviderResponse {
+            gateway: None,
+            model_mode: Default::default(),
             id: "uuid-xxx".into(),
             platform: "anthropic".into(),
             name: "Anthropic".into(),
@@ -524,6 +575,8 @@ mod tests {
     fn test_provider_response_api_key_plaintext() {
         // Pre-launch: no masking is applied to the api_key field on the wire.
         let resp = ProviderResponse {
+            gateway: None,
+            model_mode: Default::default(),
             id: "id".into(),
             platform: "openai".into(),
             name: "n".into(),
@@ -646,6 +699,9 @@ mod tests {
     fn test_create_provider_request_id_skipped_when_none() {
         // When id is None, it should not appear in serialized output.
         let req = CreateProviderRequest {
+            gateway: None,
+            header_credentials: Default::default(),
+            model_mode: Default::default(),
             id: None,
             platform: "openai".into(),
             name: "OpenAI".into(),
@@ -977,6 +1033,8 @@ mod tests {
     #[test]
     fn test_provider_health_check_response_serde() {
         let resp = ProviderHealthCheckResponse {
+            first_event_ms: None,
+            slow_first_event: false,
             provider_id: "anthropic".into(),
             platform: "anthropic".into(),
             model: "claude-sonnet-4-20250514".into(),

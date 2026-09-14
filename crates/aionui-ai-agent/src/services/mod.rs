@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod availability;
 pub mod custom;
+mod probe_observation;
 pub mod provider_health;
 pub mod remote;
 

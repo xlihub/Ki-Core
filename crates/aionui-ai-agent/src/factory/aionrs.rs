@@ -89,9 +89,6 @@ pub(super) async fn build(
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
-    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
-        .map_err(|e| AgentError::internal(e.to_string()))?;
-
     let model_id = model
         .use_model
         .as_deref()
@@ -99,31 +96,11 @@ pub(super) async fn build(
         .unwrap_or(&model.model)
         .to_owned();
 
-    let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
-    let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
-
-    let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
-        &row.platform,
-        &row.base_url,
-        &provider,
-        &model_id,
-        row.is_full_url,
-        model_overrides.openai_api_mode,
-    );
-    compat_overrides.image_input = model_overrides.image_input;
-
-    if provider == "openai" {
-        info!(
-            conversation_id = %ctx.conversation_id,
-            platform = %row.platform,
-            provider = %provider,
-            model = %model_id,
-            is_full_url = row.is_full_url,
-            api_mode = ?compat_overrides.openai_api_mode.unwrap_or_default(),
-            api_mode_source = if model_overrides.openai_api_mode.is_some() { "user" } else { "automatic" },
-            "Resolved Aionrs OpenAI transport"
-        );
-    }
+    let resolved = super::provider_connection::resolve(&row, &model_id, &deps.encryption_key)?;
+    let provider = resolved.provider;
+    let api_key = resolved.api_key;
+    let base_url = resolved.base_url;
+    let compat_overrides = resolved.compat;
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())

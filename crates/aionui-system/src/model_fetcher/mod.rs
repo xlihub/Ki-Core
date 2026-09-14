@@ -53,6 +53,19 @@ impl ModelFetchService {
         provider_id: &str,
         req: &FetchModelsRequest,
     ) -> Result<FetchModelsResponse, SystemError> {
+        let row = self
+            .repo
+            .find_by_id(user_id, provider_id)
+            .await?
+            .ok_or_else(|| SystemError::NotFound("Provider not found".into()))?;
+        if row.model_mode == "manual" {
+            let models: Vec<String> =
+                serde_json::from_str(&row.models).map_err(|_| SystemError::Internal("Invalid stored models".into()))?;
+            return Ok(FetchModelsResponse {
+                models: models.into_iter().map(aionui_api_types::ModelInfo::Id).collect(),
+                fixed_base_url: None,
+            });
+        }
         let config = self.load_provider_config(user_id, provider_id).await?;
         self.fetch_with_config(&config, req.try_fix).await
     }
@@ -64,6 +77,17 @@ impl ModelFetchService {
         &self,
         req: &FetchModelsAnonymousRequest,
     ) -> Result<FetchModelsResponse, SystemError> {
+        if req.model_mode == aionui_api_types::ProviderModelMode::Manual {
+            return Ok(FetchModelsResponse {
+                models: req
+                    .models
+                    .iter()
+                    .cloned()
+                    .map(aionui_api_types::ModelInfo::Id)
+                    .collect(),
+                fixed_base_url: None,
+            });
+        }
         validate_anonymous_request(req)?;
         let config = FetchConfig {
             platform: req.platform.clone(),
@@ -167,6 +191,9 @@ mod tests {
         let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
         let row = repo
             .create(CreateProviderParams {
+                gateway: None,
+                header_credentials_encrypted: None,
+                model_mode: "automatic",
                 id: None,
                 user_id: TEST_USER_ID,
                 platform,
@@ -264,6 +291,8 @@ mod tests {
     async fn fetch_models_anonymous_minimax_returns_hardcoded() {
         let (svc, _db) = setup().await;
         let req = FetchModelsAnonymousRequest {
+            model_mode: Default::default(),
+            models: Vec::new(),
             platform: "minimax".into(),
             base_url: "https://unused".into(),
             api_key: "fake-key".into(),
@@ -279,6 +308,8 @@ mod tests {
     async fn fetch_models_anonymous_rejects_empty_api_key() {
         let (svc, _db) = setup().await;
         let req = FetchModelsAnonymousRequest {
+            model_mode: Default::default(),
+            models: Vec::new(),
             platform: "openai".into(),
             base_url: "https://api.openai.com".into(),
             api_key: "   ".into(),
@@ -293,6 +324,8 @@ mod tests {
     async fn fetch_models_anonymous_rejects_empty_platform() {
         let (svc, _db) = setup().await;
         let req = FetchModelsAnonymousRequest {
+            model_mode: Default::default(),
+            models: Vec::new(),
             platform: "".into(),
             base_url: "https://api.openai.com".into(),
             api_key: "sk-test".into(),
@@ -310,6 +343,8 @@ mod tests {
         // but validate_anonymous_request must not reject up-front.
         let (_svc, _db) = setup().await;
         let req = FetchModelsAnonymousRequest {
+            model_mode: Default::default(),
+            models: Vec::new(),
             platform: "bedrock".into(),
             base_url: "https://bedrock.example".into(),
             api_key: "".into(),
@@ -351,6 +386,8 @@ mod tests {
         let (svc, _db) = setup().await;
         // Multi-key api_key — must not fail with header parsing error
         let req = FetchModelsAnonymousRequest {
+            model_mode: Default::default(),
+            models: Vec::new(),
             platform: "minimax".into(),
             base_url: "https://unused".into(),
             api_key: "fake-key\nanother-key".into(),

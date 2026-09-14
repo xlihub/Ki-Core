@@ -422,6 +422,9 @@ mod tests {
 
     fn enabled_provider_params() -> CreateProviderParams<'static> {
         CreateProviderParams {
+            gateway: None,
+            header_credentials_encrypted: None,
+            model_mode: "automatic",
             id: None,
             user_id: TEST_USER_ID,
             platform: "openai",

@@ -18,6 +18,9 @@ async fn repo() -> Arc<dyn IProviderRepository> {
 
 fn sample_params() -> CreateProviderParams<'static> {
     CreateProviderParams {
+        gateway: None,
+        header_credentials_encrypted: None,
+        model_mode: "automatic",
         id: None,
         user_id: USER_ID,
         platform: "anthropic",

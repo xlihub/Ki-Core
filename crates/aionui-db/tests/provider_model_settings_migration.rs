@@ -12,15 +12,25 @@ async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
         .filter(|migration| migration.version <= max_version)
         .cloned()
         .collect::<Vec<_>>();
-    Migrator {
+    let mut conn = pool.acquire().await.unwrap();
+    // Match production setup for historical table rebuilds, outside migration transactions.
+    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let result = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
         locking: true,
         no_tx: false,
     }
-    .run(pool)
-    .await
-    .unwrap();
+    .run(&mut *conn)
+    .await;
+    sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    result.unwrap();
 }
 
 #[tokio::test]

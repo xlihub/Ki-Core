@@ -4,6 +4,31 @@ This changelog records Ki-Core product releases. Runtime changes inherited from
 AionCore remain in [CHANGELOG.md](CHANGELOG.md) and are linked through the
 version mapping in [ki-core-versions.json](ki-core-versions.json).
 
+## [0.1.5](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.4...ki-core-v0.1.5) (2026-09-14)
+
+
+### Features
+
+* **ai-agent:** integrate Ki-Model 0.1.1 gateway SDK ([38df4d6](https://github.com/xlihub/Ki-Core/commit/38df4d6b597cfa7db2b729f46d36bcadb8cd72f3))
+* **ai-agent:** integrate Ki-Model 0.1.1 gateway SDK ([d8c1f12](https://github.com/xlihub/Ki-Core/commit/d8c1f12189efe2c304701dd6d48bb524e1ca1fd3))
+* **provider:** persist custom OpenAI connection options ([fd475ae](https://github.com/xlihub/Ki-Core/commit/fd475ae80dc30e485036e95fa666ad336a225733))
+* **provider:** persist OpenAI gateway connection options ([22bdc4a](https://github.com/xlihub/Ki-Core/commit/22bdc4a76f6ed90cba66c81e30d86f1d98a5991a))
+
+
+### Bug Fixes
+
+* **provider:** preserve concurrent credential updates ([3f2b617](https://github.com/xlihub/Ki-Core/commit/3f2b6170be40acba9f020aa0155638915b1ee177))
+
+
+### Documentation
+
+* **provider:** record live mock verification ([1346ac8](https://github.com/xlihub/Ki-Core/commit/1346ac850a5a0af2899cc29ab9a00d5a59ded90e))
+
+
+### Miscellaneous Chores
+
+* **release:** select Ki-Core v0.1.5 ([#30](https://github.com/xlihub/Ki-Core/issues/30)) ([12941cd](https://github.com/xlihub/Ki-Core/commit/12941cd2ab7904854bb0c723854273c21399be15))
+
 ## [0.1.4](https://github.com/xlihub/Ki-Core/compare/ki-core-v0.1.3...ki-core-v0.1.4) (2026-08-27)
 
 

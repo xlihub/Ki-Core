@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "repository": "xlihub/Ki-Model",
+  "targetTag": "ki-model-v0.1.1",
+  "peeledCommit": "6e9a710738fac4e76d03d936c0c69d26cec96157",
+  "releaseVerified": true,
+  "packageVersion": "0.2.11",
+  "upstream": {
+    "repository": "iOfficeAI/aionrs",
+    "tag": "v0.2.11",
+    "peeledCommit": "8e61a90329fa9f67c4fdf7e97fe02c24dba33f75"
+  }
+}

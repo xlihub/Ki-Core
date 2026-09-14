@@ -219,7 +219,11 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let provider = super::providers::create_provider(&config, config_extra.compat_overrides.gateway.as_ref())
+            .map_err(|error| AgentError::internal(format!("Provider creation failed: {error}")))?;
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .provider(provider)
+            .runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -435,6 +439,22 @@ impl IAgentTask for AionrsAgentManager {
             }
         };
 
+        // Local commands return zero turns and no model answer. For model
+        // runs, an empty or incomplete result must not become Core success.
+        let result = result.map(|result| {
+            result.and_then(|answer| {
+                if (answer.turns > 0 && answer.text.trim().is_empty())
+                    || answer.stop_reason != aion_types::message::StopReason::EndTurn
+                {
+                    Err(aion_agent::error::AgentError::ApiError(format!(
+                        "Provider returned no complete answer (stop_reason={:?})",
+                        answer.stop_reason
+                    )))
+                } else {
+                    Ok(answer)
+                }
+            })
+        });
         let elapsed_ms = now_ms() - started_at;
         self.runtime.bump_activity();
 

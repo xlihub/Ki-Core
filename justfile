@@ -68,6 +68,11 @@ release-please-check-test:
 release-workflows-check-test:
     @{{release_workflows_test_script}}
 
+# Validate the explicitly adopted Ki-Model dependency
+model-pin-check:
+    @python3 scripts/ki-core-release/validate-model-pin.py
+    @python3 scripts/ki-core-release/validate-model-pin.test.py
+
 # Lint (warnings = errors)
 lint:
     @just _cargo clippy --workspace -- -D warnings
@@ -85,7 +90,7 @@ fmt-check:
     @cargo fmt --all -- --check
 
 # Lint + format check + migration check + test
-check: migration-check release-metadata-check release-metadata-check-test release-please-check-test release-workflows-check-test lint fmt-check test
+check: migration-check model-pin-check release-metadata-check release-metadata-check-test release-please-check-test release-workflows-check-test lint fmt-check test
 
 # Run the server (debug)
 run *ARGS:
@@ -96,7 +101,7 @@ run-release *ARGS:
     @just _cargo run --release --bin aioncore -- {{ARGS}}
 
 # Pre-push gate: migration check, format, lint, auto-commit fixes, test, then push
-push *ARGS: migration-check lint-fix fmt _auto-commit-fixes test
+push *ARGS: migration-check model-pin-check lint-fix fmt _auto-commit-fixes test
     git push {{ARGS}}
 
 # Auto-commit any formatting/lint fixes if there are changes

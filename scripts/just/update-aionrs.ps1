@@ -11,6 +11,9 @@ $aioncoreSlug = "iOfficeAI/AionCore"
 function Fail($msg) { Write-Error $msg; exit 1 }
 
 # preflight
+if (Test-Path (Join-Path $repoRoot "ki-core-model.json")) {
+    Fail "Ki-Core pins Ki-Model independently; adopt a verified SDK release through a product/main PR"
+}
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail "gh CLI not found" }
 gh auth status *> $null
 if ($LASTEXITCODE -ne 0) { Fail "gh not authenticated; run 'gh auth login'" }

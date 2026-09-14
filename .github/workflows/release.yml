@@ -56,6 +56,7 @@ jobs:
             exit 1
           fi
           KI_CORE_VERIFY_REMOTE_TAG=1 scripts/ki-core-release/validate-release-metadata.sh
+          python3 scripts/ki-core-release/validate-model-pin.py --require-release
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
   build:

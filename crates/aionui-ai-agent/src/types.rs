@@ -121,6 +121,8 @@ impl RuntimeCapabilities {
 /// Provider-specific compat overrides resolved in the factory.
 #[derive(Debug, Clone, Default)]
 pub struct AionrsCompatOverrides {
+    /// Optional gateway configuration; absence preserves the SDK defaults.
+    pub gateway: Option<crate::manager::aionrs::providers::GatewayConfig>,
     pub(crate) openai_api_mode: Option<OpenAiApiMode>,
     pub(crate) image_input: Option<ImageInputCapability>,
     pub max_tokens_field: Option<String>,
